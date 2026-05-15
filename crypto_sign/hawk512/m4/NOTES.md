@@ -38,12 +38,17 @@ This commit is the **reference C baseline** — every entry point now
 runs the full HAWK protocol end-to-end on Cortex-M4. The next steps
 swap targeted hot paths for M4-tuned versions:
 
-1. **SHAKE-256 → pqm4 assembly.** Replace `sha3.c` (or the
-   `shake_*` API surface it exposes) with the optimised Keccak
-   assembly already in `mupq/common/` (`keccakf1600.c` +
-   the M4F asm). Affects keygen seeding, signature hashing, and
-   verification hashing — non-trivial cycle savings across the
-   board since HAWK SHAKEs heavily.
+1. ~~**SHAKE-256 → pqm4 assembly.**~~ ✅ Done.
+   `sha3.c` is now a ~150-line shim onto pqm4's
+   `KeccakF1600_State{Permute,XORBytes,ExtractBytes}` (provided by
+   `libsymcrypto.a` built from `common/keccakf1600.S`). The 1.2 k-line
+   Cortex-M4 Keccak inline-asm shipped by hawk-sign/dev is removed; the
+   permutation is now shared with every other pqm4 m4 scheme. The
+   public `shake_context` ABI is preserved (same struct layout, same
+   entry-point names) so no other HAWK source needed to change.
+   End-to-end host smoke test (keygen → sign → verify roundtrip) still
+   passes, confirming hash-output equivalence with the upstream
+   reference.
 
 2. **Plantard NTT for HAWK's modulus.** HAWK keygen and verify use
    small-prime NTTs (`modq.h`, default Q = 18433) for polynomial
