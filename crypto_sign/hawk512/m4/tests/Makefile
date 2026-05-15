@@ -19,12 +19,16 @@ SOURCES = test_sha3_glue.c \
           $(TOP)/mupq/common/keccakf1600.c \
           $(TOP)/mupq/common/fips202.c
 
-.PHONY: all build run clean
+.PHONY: all build run run-calibrate clean
 all: build
-build: test_sha3_glue
+build: test_sha3_glue test_plantard_calibrate
 test_sha3_glue: $(SOURCES)
 	$(CC) $(CFLAGS) $(INCLUDES) -o $@ $(SOURCES)
+test_plantard_calibrate: test_plantard_calibrate.c
+	$(CC) $(CFLAGS) $(INCLUDES) -o $@ test_plantard_calibrate.c
 run: test_sha3_glue
 	./test_sha3_glue
+run-calibrate: test_plantard_calibrate
+	./test_plantard_calibrate
 clean:
-	rm -f test_sha3_glue
+	rm -f test_sha3_glue test_plantard_calibrate
