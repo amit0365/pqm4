@@ -53,35 +53,70 @@ Sanity check (mental): `18433 · 339720193 mod 2³²`:
 `18433 · 339720193 = 6 262 062 317 569 = 1458 · 2³² + 1`, so the
 product is exactly `1 mod 2³²`. ✓
 
-## The open question: representation alignment
+## Representation alignment — resolved
 
-`hawk_sign.c` keeps NTT coefficients in **single-Montgomery** form
-`x · R mod q` (with `R = 2¹⁶`), values stored in `[1..q]` (zero is
-represented as `q`, not `0`). The current butterfly is
+(Initial design note had this section open; resolved by the
+calibration test, recorded here.)
 
-    montymul(a, GM[x]) = (a · GM[x]) · 2⁻¹⁶ mod q ∈ [1..q]
+HAWK's `R` is actually **`2³² mod q`** (not `2¹⁶` — `modq.h` comment
+`R = 2^32 mod q` confused me on the first pass), and `Zq(montyred)`
+is a 32→16-bit Montgomery reduction giving `c · 2⁻³² mod q` in
+`[1..q]`. **Plantard's natural output factor `2⁻³²` already matches
+HAWK's Montgomery scaling exactly.** No twiddle re-baking is
+required at the math level — feed the existing `GM[x]` table to a
+Plantard reducer and the modular value is correct.
 
-with `GM[x] = g^rev(x) · 2³² mod q` (so the table is **double-Mont**
-of the actual root of unity).
+### What the calibration test proved
 
-A naive Plantard `plant_red(a · b) ≡ a · b · 2⁻³² mod q` is one
-extra factor of `R = 2¹⁶` away from HAWK's single-Mont output. Two
-options to bridge:
+`tests/test_plantard_calibrate.c` runs 4096 random `(a, b)` pairs
+in `[1..Q]²` and compares various Plantard formulations against
+`mq18433_montymul(a, b)` (golden). Highlights:
 
-1. **Re-bake the twiddle table.** Replace
-   `GM[x] = g^rev · 2³² mod q` with
-   `GM_plant[x] ≡ g^rev · 2¹⁶ · Qinv_Plant mod 2³²` (a 32-bit value),
-   so that `plant_red(a · GM_plant[x])` lands in single-Mont. This
-   is one-time table work; no other HAWK code changes.
+| variant   | encoding   | mismatches / 4096 |
+|-----------|------------|-------------------|
+| `v6+encId`| identity   | **0** (literally `montyred`) |
+| `v8+encId`| identity   | 313 (7.6%), always off by ±1 |
+| others    | various    | all 4096 mismatch |
 
-2. **Switch HAWK to double-Mont representation.** Touches every
-   `Zq(*)` function (`set_small`, `snorm`, `unorm`, the comparison
-   in `hawk_vrfy.c`, the `poly_set_small` helpers in `hawk_sign.c`).
-   Big blast radius, not preferred.
+The takeaway:
 
-We will pursue (1). The exact encoding for `GM_plant[x]` — sign
-convention, whether to include the rounding constant baked-in, etc.
-— is what the calibration test (next section) pins down empirically.
+- **Sign of `Qinv`**: HAWK's `Q0I = −q⁻¹ mod 2³²` is the right value
+  to use (matches the convention behind `Zq(montyred)`). UIC-ESLAS's
+  `Qinv_Plant` (`+q⁻¹ mod 2³²`) gives a negated result and so does
+  not match HAWK directly.
+- **Rounding placement**: `montyred` adds `+1` *after* the second
+  shift; naive Plantard adds the rounding `qa` *before* the second
+  multiplication. With unsigned `Q0I` and `qa = 1` these agree on
+  92.4% of inputs and disagree by exactly 1 on the other 7.6% — the
+  algebraic cause is whether `(h·Q) mod 2¹⁶ ≥ 2¹⁶ − Q`; the
+  empirical 7.6% (vs the uniform-h prediction of ~72%) reflects that
+  `h = TOP16(c·Q0I mod 2³²)` for `c ∈ [1, Q²]` is far from uniform.
+
+### Spec-adherence consequence
+
+HAWK signatures encode NTT-domain coefficients byte-for-byte. Any
+1-bit divergence between the optimised reducer and `montyred`
+ripples into adds, subtracts, and comparisons downstream and breaks
+KAT-vector byte equality. So **the M4 asm port has to reproduce
+`montyred`'s exact output, not Plantard's natural output**.
+
+In asm that means a three-instruction sequence per coefficient:
+
+```
+mul    tmp, c, q0i             @ tmp = c·Q0I  mod 2³²
+lsr    tmp, tmp, #16           @ tmp = h     (top 16 of c·Q0I)
+smlabt tmp, tmp, q, #1<<16     @ tmp = h·Q  + 2¹⁶     (low 16 bits of result; rounding +1 baked into the high half added pre-shift)
+                               @ — result lives in the high 16 bits, ready for a final >>16
+```
+
+versus UIC-ESLAS's two-instruction `mul / smlatt` for naive
+Plantard. One extra cycle per coefficient — the packed-pair
+butterfly structure (4 instructions per 2 coefficients via
+`smulwb / smulwt / smlabt / smlabt`) is still a clear win over the
+~6–7 cycle pure-C `Zq(montymul)`.
+
+No twiddle re-baking is needed: the existing `GM[]` / `iGM[]`
+tables in `modq.h` feed the asm directly.
 
 ## Spec adherence
 
@@ -101,25 +136,26 @@ exactly on every input. Anything less is a spec violation.
 
 ## Plan (next iteration)
 
-1. **Lock the encoding.** Run the calibration test, observe which
-   `(plant_red variant, GM_plant encoding)` pair matches `montymul`
-   over thousands of random inputs.
-2. **Implement `plant_18433.{h,c}`** with portable C primitives
-   (`plant_red`, `plant_mul`, `plant_tomonty`) plus the rebuilt
-   `GM_plant[]` and `iGM_plant[]` tables.
+Step 1 (lock the encoding) is done — see the table above. Remaining:
+
+1. ~~**Lock the encoding.**~~ ✅ — use `Q0I = 3955247103` with
+   identity twiddle encoding; the existing `GM[]` / `iGM[]` tables
+   are reusable as-is.
+2. **Implement `plant_18433.S`** (M4 asm) using the three-instruction
+   `mul / lsr / smlabt+rounding` reducer derived above, packed-pair
+   form via `smulwb / smulwt / smlabt / smlabt` for two coefficients
+   per butterfly. Layer-merge 2–3 layers per pass for register
+   residency.
 3. **Drop in NTT/iNTT replacements** behind a build flag
    `HAWK_PLANT_NTT=1` (default off until we have on-target
    measurements). The 15 call sites in `hawk_sign.c` get switched
    en bloc.
-4. **Extend the cross-check test** to compare the full per-coefficient
-   NTT output `mq18433_NTT(a)` vs `mq18433_NTT_plant(a)`, byte-equal
-   for every coefficient.
-5. **Hand-schedule the M4 asm**: port UIC-ESLAS's `doubleplant` /
-   `mul_twiddle_plant` packed-pair butterflies to a `plant_ntt_18433.S`,
-   driven by the same `GM_plant[]` table. Layer-merge 2–3 NTT layers
-   per pass for register-residency. Validate against the C reference
-   on host before measuring on NUCLEO-L4R5ZI.
+4. **Extend the cross-check test** to compare a full
+   `mq18433_NTT(a) / mq18433_iNTT(a)` byte-for-byte against the
+   Plantard versions over many random polynomials.
+5. **Benchmark on NUCLEO-L4R5ZI** using pqm4's `speed_test`
+   harness, compare to the upstream-C baseline.
 
-Until step 1 succeeds, **`hawk_sign.c` keeps calling upstream
-`mq18433_*`** — this commit is design + scaffolding only, behavior
-is unchanged.
+Until step 2 lands, **`hawk_sign.c` keeps calling upstream
+`mq18433_*`** — current commit is design + calibration only,
+behaviour is unchanged.

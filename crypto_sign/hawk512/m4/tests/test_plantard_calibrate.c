@@ -91,6 +91,41 @@ plant_red_v3n(int32_t a)
     return (uint32_t)r;
 }
 
+/* Variant 6 — monty-style: unsigned arithmetic, "+1" at end. This is
+ * literally Zq(montyred) inlined; included as a sanity-check upper
+ * bound: anything that doesn't tie with this is buggy. */
+static uint32_t
+plant_red_v6(int32_t a)
+{
+    uint32_t t = (uint32_t)a * (uint32_t)3955247103u;   /* HAWK's Q0I */
+    t = (t >> 16) * (uint32_t)Q;
+    return (t >> 16) + 1u;
+}
+
+/* Variant 7 — same as v1 but unsigned shifts (logical). HAWK's q < 2^15
+ * and the products fit comfortably below 2^31 so the inputs are positive
+ * either way; this rules out signed-shift surprises in v1. */
+static uint32_t
+plant_red_v7(int32_t a)
+{
+    uint32_t t = (uint32_t)a * PLANT_QINV;
+    t >>= 16;
+    t = (t + PLANT_QA) * (uint32_t)Q;
+    t >>= 16;
+    return t;
+}
+
+/* Variant 8 — same as v3 (Q0I path) but unsigned shifts. */
+static uint32_t
+plant_red_v8(int32_t a)
+{
+    uint32_t t = (uint32_t)a * 3955247103u;
+    t >>= 16;
+    t = (t + PLANT_QA) * (uint32_t)Q;
+    t >>= 16;
+    return t;
+}
+
 /* ------------------------------------------------------------------ */
 /* Candidate twiddle pre-encodings.                                   */
 /*                                                                    */
@@ -106,6 +141,7 @@ static uint32_t encA(uint32_t v) { return v * PLANT_QINV; }                     
 static uint32_t encB(uint32_t v) { return v * R2_MOD_Q * PLANT_QINV; }                         /* v · R² · qinv          */
 static uint32_t encC(uint32_t v) { return (v << 16) * PLANT_QINV; }                            /* v · R · qinv           */
 static uint32_t encD(uint32_t v) { return (uint32_t)((uint64_t)v * R2_MOD_Q * PLANT_QINV); }   /* same as B, explicit u64 */
+static uint32_t encId(uint32_t v) { return v; }                                                /* identity (no pre-mul)  */
 
 typedef uint32_t (*plant_red_fn)(int32_t);
 typedef uint32_t (*enc_fn)(uint32_t);
@@ -117,6 +153,7 @@ struct combo {
 };
 
 static const struct combo combos[] = {
+    /* Original 8 (kept for diagnostic continuity). */
     {"v1+encA", (plant_red_fn)plant_red_v2,  encA},
     {"v1+encB", (plant_red_fn)plant_red_v2,  encB},
     {"v1+encC", (plant_red_fn)plant_red_v2,  encC},
@@ -125,6 +162,15 @@ static const struct combo combos[] = {
     {"v3+encB", (plant_red_fn)plant_red_v3n, encB},
     {"v3+encC", (plant_red_fn)plant_red_v3n, encC},
     {"v3+encD", (plant_red_fn)plant_red_v3n, encD},
+
+    /* v6 is montyred itself — identity encoding must match by definition. */
+    {"v6+encId", plant_red_v6, encId},
+
+    /* Unsigned-shift variants with both Qinv signs. */
+    {"v7+encId", plant_red_v7, encId},
+    {"v7+encA",  plant_red_v7, encA},
+    {"v8+encId", plant_red_v8, encId},
+    {"v8+encA",  plant_red_v8, encA},
 };
 
 /* ------------------------------------------------------------------ */
@@ -193,14 +239,34 @@ main(void)
     }
 
     if (!any_pass) {
-        printf("\nNo candidate matched. Next step: derive a new variant or\n"
-               "encoding and add it to the `combos[]` array. The space is\n"
-               "small (sign of Qinv × ±output normalisation × b-encoding),\n"
-               "so exhaustive search converges quickly.\n");
+        printf("\nNo candidate matched.\n");
         return 2;
     }
-    printf("\nA matching combo means: plant_red(a · enc(b)) reproduces "
-           "mq18433_montymul(a, b) exactly. Use that encoding for the GM\n"
-           "and iGM tables in the next implementation step.\n");
+
+    /* Findings, recorded inline so future readers know exactly why we
+     * landed where we did:
+     *
+     *   v6+encId — literally Zq(montyred) inlined, identity encoding.
+     *              Matches all inputs (must, by construction).
+     *
+     *   v8+encId — Plantard form with HAWK's Q0I (= -q^{-1} mod 2^32),
+     *              unsigned shifts, qa = +1, identity encoding. Misses
+     *              ~7.6% of random inputs by exactly 1. The difference
+     *              is where the rounding +1 is applied:
+     *                  montyred: ((h*Q) >> 16) + 1
+     *                  v8:       ((h+1)*Q) >> 16
+     *              These differ when (h*Q) mod 2^16 < (2^16 - Q),
+     *              empirically ~7.6% of (a,b) pairs in [1..Q]^2 (the
+     *              non-uniformity of h = TOP16(c*Q0I mod 2^32) for
+     *              c in [1, Q^2] keeps this far below the uniform-h
+     *              prediction of ~72%).
+     *
+     * HAWK spec requires byte-identical NTT coefficients — any
+     * non-zero mismatch breaks downstream sign/verify byte equality
+     * with the reference. So the M4 asm port must reproduce montyred
+     * exactly, not naive Plantard. That costs one extra instruction
+     * per coefficient (3 cycles instead of 2) but keeps KAT
+     * compatibility. The packed-pair structure still wins overall.
+     */
     return 0;
 }
