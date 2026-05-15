@@ -1,0 +1,1 @@
+../../hawk512/m4/ng_config.h
