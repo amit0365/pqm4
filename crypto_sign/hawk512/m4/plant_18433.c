@@ -32,10 +32,22 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "plant_18433.h"
+
+/* On Cortex-M4 with DSP, the assembly in plant_18433_cm4.S provides
+ * mq18433_{NTT,iNTT,montymul}_plant with externally-linked symbol names
+ * that match the prototypes in plant_18433.h. To avoid duplicate
+ * definitions, the C bodies below are guarded out for that target.
+ *
+ * The asm has been cross-checked byte-identical to the Zq(NTT/iNTT/montymul)
+ * references in modq.h across logn = 1..10 (HAWK-512 + HAWK-1024). See
+ * tests/m4/test_ntt.c and tests/m4/test_montymul.c, run under QEMU
+ * (mps2-an386 board) with semihosting.
+ */
+#if !(defined(__ARM_FEATURE_DSP) && __ARM_FEATURE_DSP)
+
 #define Q   18433
 #include "modq.h"
-
-#include "plant_18433.h"
 
 /* Forward NTT — Cooley-Tukey, in-place. Mirrors Zq(NTT) in modq.h
  * line-for-line; calls into the static inline mq18433_montymul. The
@@ -98,3 +110,5 @@ mq18433_montymul_plant(uint32_t x, uint32_t y)
 {
 	return mq18433_montymul(x, y);
 }
+
+#endif /* !__ARM_FEATURE_DSP — close C-fallback guard at top of file */

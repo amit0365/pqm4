@@ -119,19 +119,51 @@ record. The short version:
 
 ## 5. The four-item plan from the original brief
 
-Status of each item the user originally asked for:
+Status of each item the user originally asked for (updated 2026-05-16):
 
 | # | item | status |
 |---|------|--------|
-| 1 | `plant_18433.S` packed-pair kernel | **Not done.** Sandbox has no ARM cross-toolchain. Path B asm is the cleanest next step (see below). |
+| 1 | `plant_18433_cm4.S` kernel | ✅ **Done (scalar v1)**. Cross-checks byte-identical to `Zq(NTT/iNTT/montymul)` across logn = 1..10 under QEMU mps2-an386. See `tests/m4/`. Packed-pair optimization deferred to v2 (see §6 below). |
 | 2 | Wire into `hawk_sign.c` behind `HAWK_PLANT_NTT=1` | ✅ Done (commit `229e94e`). |
-| 3 | Cross-check `mq18433_NTT/iNTT` byte-for-byte vs plant | ✅ Done; currently trivial because plant C is the reference verbatim. Will become a real check once asm lands. |
-| 4 | Benchmark on NUCLEO-L4R5ZI via `speed_test` | **Not done.** Needs hardware. |
+| 3 | Cross-check `mq18433_NTT/iNTT` byte-for-byte vs plant | ✅ **Done for both C path AND asm path**. Host test (`tests/test_plant_ntt.c`) covers C fallback; QEMU test (`tests/m4/test_ntt.c`) covers asm. Both report `ALL TESTS PASSED`. |
+| 4 | Benchmark on NUCLEO-L4R5ZI via `speed_test` | **Not done.** Needs hardware. Build instructions in §6.5 below. |
 
-## 6. What to do next (Path B, concrete)
+## 6. What's already implemented in `plant_18433_cm4.S` (and what's next)
 
-The unblocking deliverable is **`crypto_sign/hawk512/m4/plant_18433_cm4.S`**.
-Spec:
+**Current state (2026-05-16)**: Scalar v1 is in place and cross-checked.
+
+- `mq18433_montymul_plant`: 5-instruction Plantard kernel (mul/mul/lsr/mla/lsr)
+  plus constant loads + return. Verified byte-identical to `Zq(montymul)` over
+  4096 random + 8 spot test cases.
+- `mq18433_NTT_plant`: scalar Cooley-Tukey forward NTT. Per-coefficient
+  butterfly. Verified byte-identical to `Zq(NTT)` for logn = 1..10 (HAWK-512
+  AND HAWK-1024).
+- `mq18433_iNTT_plant`: scalar Gentleman-Sande inverse NTT. Verified
+  byte-identical to `Zq(iNTT)` for logn = 1..10.
+
+**Verification harness**: `crypto_sign/hawk512/m4/tests/m4/` — bare-metal
+Cortex-M4 ELF for QEMU `mps2-an386` board with semihosting. Run via:
+```
+make -C crypto_sign/hawk512/m4/tests/m4 run        # montymul test
+make -C crypto_sign/hawk512/m4/tests/m4 run-ntt    # NTT + iNTT test
+```
+Requires `arm-none-eabi-gcc` and `qemu-system-arm` (both available via
+homebrew on macOS).
+
+**Next: packed-pair optimization (v2)**. The scalar version is correct but
+modest in speedup — roughly parity with inlined C, since the per-butterfly
+cycle count is similar (~20 cycles per butterfly each). The real 3-4×
+speedup HANDOFF targeted needs **packed-pair butterflies** processing 2
+coefficients per iteration via `usub16` / `uadd16` / `sel` for canonical
+add/sub. v2 work order:
+
+1. Add a packed-pair inner loop that fires when `ht >= 2` (i.e., all but
+   the last layer).
+2. Keep the last layer (ht=1) on the scalar path.
+3. Re-run the QEMU cross-check — it WILL catch any bugs the per-layer
+   sweep covers.
+
+**For the curious — original Path B spec, retained for reference**:
 
 1. **Symbols to export**: `mq18433_NTT_plant`, `mq18433_iNTT_plant`,
    `mq18433_montymul_plant` (matching `plant_18433.h`).
@@ -187,31 +219,37 @@ Spec:
 
 ## 7. Things deliberately *not* done (so the next agent doesn't re-do them)
 
-- **No M4 asm has been written.** Two earlier attempts had bugs
-  before they could even be tested. Better to start fresh.
-- **No `plant_18433_cm4_tables.c`** exporting `mq18433_GM_extern`.
-  Needed once the asm wants to reach the static `mq18433_GM[]`
-  from `modq.h`.
-- **No `config.mk`** inside `crypto_sign/hawk{512,1024}/m4/`. pqm4
-  picks up `config.mk` per scheme if it exists; set
-  `HAWK_PLANT_NTT=1` there (via `CPPFLAGS += -DHAWK_PLANT_NTT=1`)
-  once the asm is verified, *not* before.
-- **No actual on-target benchmarks.** Numbers in `PLANTARD_NOTES.md`
-  ("3-4× speedup", "~3 cycles vs C's ~6-7") are estimates from
-  reading the asm and counting instructions. The real numbers will
-  be different.
+- **Packed-pair NTT optimization (v2)**: deferred. Scalar v1 is correct
+  and validates the kernel + canonical-form arithmetic. v2 is a refactor
+  for speed, not correctness. See §6 above.
+- **No `config.mk`** inside `crypto_sign/hawk{512,1024}/m4/` yet. pqm4
+  picks up `config.mk` per scheme if it exists; set `HAWK_PLANT_NTT=1`
+  there (via `CPPFLAGS += -DHAWK_PLANT_NTT=1`). Once v2 lands AND
+  on-target benchmarks confirm the win, flip the default to on.
+- **No actual on-target benchmarks.** QEMU cycle counts are not
+  representative — Cortex-M4 cycle accuracy in QEMU is best-effort, and
+  flash wait states, instruction prefetch, and bus contention on real
+  silicon will move the numbers. Run `speed.elf` on NUCLEO-L4R5ZI for
+  real numbers.
+- **Q0I constant typo in earlier HANDOFF**: the previous draft of §4
+  / §6 referred to `Q0I = 3955247103 = 0xEBC97FFF`. The correct hex is
+  `0xEBC047FF`. The math (3955247103 decimal) is correct everywhere
+  except that one stray hex value, and the asm uses the correct
+  constant. Mentioned here in case a future agent searches for the bad
+  hex.
 
-## 8. Files the next agent will touch
+## 8. Files in the m4 directory (current layout)
 
-| File | What it does | Touch? |
-|------|--------------|--------|
-| `crypto_sign/hawk512/m4/plant_18433_cm4.S` | M4 asm replacement for `plant_18433.c`. **Doesn't exist yet — this is the deliverable.** | CREATE |
-| `crypto_sign/hawk512/m4/plant_18433.c` | C fallback, byte-identical to reference NTT. Wrap function bodies in `#if !(defined(__ARM_FEATURE_DSP) && __ARM_FEATURE_DSP)`. | MODIFY |
-| `crypto_sign/hawk512/m4/plant_18433_cm4_tables.c` | (optional) Non-static aliases for `mq18433_GM[]` / `mq18433_iGM[]` so the asm can reach them. | CREATE if needed |
-| `crypto_sign/hawk512/m4/PLANTARD_NOTES.md` | Design log. Append findings, don't rewrite. | APPEND |
-| `crypto_sign/hawk512/m4/tests/test_plant_ntt.c` | Cross-check. Already correct; will start *meaningfully* passing once asm lands. | LEAVE |
-| `crypto_sign/hawk1024/m4/` | Mirror of hawk512/m4 via symlinks. The asm file should be symlinked from here too once added. | ADD SYMLINK |
-| `crypto_sign/hawk512/m4/hawk_sign.c` | Has the `HAWK_PLANT_NTT` macro layer at the top. Leave alone. | LEAVE |
+| File | Status | Notes |
+|------|--------|-------|
+| `plant_18433_cm4.S` | ✅ Scalar v1 in place | NTT, iNTT, montymul. Cross-checked. Packed-pair v2 pending. |
+| `plant_18433_cm4_tables.c` | ✅ Created | Externalized copies of `mq18433_GM[]` / `mq18433_iGM[]`. Guarded by `__ARM_FEATURE_DSP` so they're emitted only on M4. |
+| `plant_18433.c` | ✅ Guarded | C bodies wrapped in `#if !(__ARM_FEATURE_DSP)`. Host build uses C; M4 build uses asm. |
+| `plant_18433.h` | Unchanged | Function prototypes for both impls. |
+| `tests/test_plant_ntt.c` | Host cross-check | Passes byte-identical (C path). |
+| `tests/m4/` | ✅ New | QEMU bare-metal harness: `qemu.ld`, `startup.S`, `semihost.h`, `test_montymul.c`, `test_ntt.c`, `Makefile`. |
+| `hawk_sign.c` | Unchanged | `HAWK_PLANT_NTT` macro layer at top. Macro substitution applies to both C and asm paths. |
+| `../../hawk1024/m4/plant_18433*` | ✅ Symlinked | hawk1024 picks up the same scalar v1 via symlinks to hawk512/m4. |
 
 ## 9. What to push when you finally have GitHub auth
 
