@@ -1,3 +1,4 @@
 test_sha3_glue
 test_plantard_calibrate
 test_plant_ntt
+test_plant_twiddle

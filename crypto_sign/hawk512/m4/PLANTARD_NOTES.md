@@ -134,6 +134,63 @@ This is what the calibration test in
 Plantard encodings to find the one that reproduces the golden value
 exactly on every input. Anything less is a spec violation.
 
+## pqm4 already ships UIC-ESLAS Plantard NTT — reusable scaffolding
+
+After the encoding above was locked I noticed pqm4 already vendors
+the full Plantard NTT from Huang et al. (TCHES 2024) at:
+
+    crypto_sign/ml-dsa-{44,65,87}/m4f/macros_smallntt.i
+    crypto_sign/ml-dsa-{44,65,87}/m4f/smallntt_769.S
+
+The macros file is fully parameterised by register names (`q`, `qa`,
+`qinv`, `tmp`) so the entire asm template is reusable. What changes
+for HAWK:
+
+  | concern                 | ml-dsa (q=769, n=256)                | HAWK (Q=18433, n=512/1024)                 |
+  |-------------------------|--------------------------------------|--------------------------------------------|
+  | `q` immediate           | `movt q, #769`                       | `movt q, #18433` (still 16-bit immediate)  |
+  | `qa` constant           | `movw qa, #24608` (= q·32, plant rc=32) | depends on representation choice (below) |
+  | twiddle table           | `zetas_asm_769[128]` (int32, pre-encoded) | derive `mq18433_GM_plant[]` from `GM[]` |
+  | layer-merge structure   | hand-unrolled for n=256              | +1 layer-group for n=512, +2 for n=1024    |
+
+## The representation gap (path-A vs path-B)
+
+`tests/test_plant_twiddle.c` simulates the asm `mul_twiddle_plant` in
+C and searches the encoding space. Best candidate (`encA qa=0x10000`,
+i.e. twiddle pre-multiplied by `Q0I`, rounding `+1<<16`) still misses
+~51 % of random `(a, b)` pairs in `[1..Q]²` against `mq18433_montymul`.
+
+Root cause: `smulwb` is a **signed** multiply with a **signed** `>>16`,
+so the high-half it produces differs from HAWK's `montyred`-style
+**unsigned** `>>16` by exactly `2¹⁶` whenever bit 31 of `c·Q0I` is set
+(~50 % of inputs). Plantard's natural output range is `[-q, q]`
+(roughly), HAWK's intermediate convention is `[1..Q]`.
+
+`hawk_sign.c` interleaves NTT calls with `mq18433_montymul` /
+`mq18433_sub` / `mq18433_tomonty` on individual coefficients, so the
+post-NTT data must be in HAWK's canonical `[1..Q]` representation —
+we cannot just leave it in Plantard's centred form mid-protocol.
+
+Two ways forward, both keep the locked-down `Q0I = 3955247103` and
+`mul_twiddle_plant` macro:
+
+  **Path A** (mirrors ml-dsa): run the whole NTT in Plantard's
+  centred-signed representation, then sweep one normalisation pass
+  at NTT exit to convert each coefficient from `[-q, q]` to `[1..Q]`.
+  Pointwise helpers between NTT calls need matching signed/unsigned
+  versions, *or* the normalisation pass runs both at NTT exit AND
+  before re-entry. The fastest variant, matches the upstream Plantard
+  literature.
+
+  **Path B** (touches the inner kernel): bake the conditional `+Q`
+  into the inner butterfly so the running representation stays
+  `[1..Q]` throughout. Easier to drop in (no other code changes
+  needed), but ~1–2 extra cycles per butterfly.
+
+The choice is a perf/intrusiveness tradeoff; either honours the
+HAWK spec because the cross-check test (`test_plant_ntt.c`) will
+catch any byte-drift in the integrated NTT output.
+
 ## Plan (next iteration)
 
 1. ~~**Lock the encoding.**~~ ✅ — use `Q0I = 3955247103` with

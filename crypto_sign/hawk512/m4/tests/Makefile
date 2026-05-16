@@ -21,20 +21,24 @@ SOURCES = test_sha3_glue.c \
 
 PLANT_SOURCES = test_plant_ntt.c ../plant_18433.c
 
-.PHONY: all build run run-calibrate run-plant clean
+.PHONY: all build run run-calibrate run-plant run-twiddle clean
 all: build
-build: test_sha3_glue test_plantard_calibrate test_plant_ntt
+build: test_sha3_glue test_plantard_calibrate test_plant_ntt test_plant_twiddle
 test_sha3_glue: $(SOURCES)
 	$(CC) $(CFLAGS) $(INCLUDES) -o $@ $(SOURCES)
 test_plantard_calibrate: test_plantard_calibrate.c
 	$(CC) $(CFLAGS) $(INCLUDES) -o $@ test_plantard_calibrate.c
 test_plant_ntt: $(PLANT_SOURCES)
 	$(CC) $(CFLAGS) $(INCLUDES) -o $@ $(PLANT_SOURCES)
+test_plant_twiddle: test_plant_twiddle.c
+	$(CC) $(CFLAGS) $(INCLUDES) -o $@ test_plant_twiddle.c
 run: test_sha3_glue
 	./test_sha3_glue
 run-calibrate: test_plantard_calibrate
 	./test_plantard_calibrate
 run-plant: test_plant_ntt
 	./test_plant_ntt
+run-twiddle: test_plant_twiddle
+	./test_plant_twiddle
 clean:
-	rm -f test_sha3_glue test_plantard_calibrate test_plant_ntt
+	rm -f test_sha3_glue test_plantard_calibrate test_plant_ntt test_plant_twiddle
