@@ -207,11 +207,12 @@ ntt_vloop_packed:
     ldr.w   r1, [r11, r9]              @ r1 = x2 (offset HT_bytes from p_k1)
 
     @ Plantard kernel applied to each half of x2 separately.
-    @ Cannot pack because c_i = x2_i * s is up to 30 bits per cell.
-    uxth    r3, r1                     @ r3 = x2_lo
-    lsr     r8, r1, #16                @ r8 = x2_hi
-    mul     r3, r3, r2                 @ r3 = c_lo  = x2_lo * s
-    mul     r8, r8, r2                 @ r8 = c_hi
+    @ Cannot pack the c_i = x2_i * s product (up to 30 bits per cell),
+    @ but smulbb/smultb fuse the unpack+multiply: HAWK's Q < 2^15 so
+    @ x2 halves never have bit 15 set ⇒ signed = unsigned multiply.
+    @ Pattern borrowed from Pornin's fndsa mq_cm4.s.
+    smulbb  r3, r1, r2                 @ r3 = bot16(r1) * bot16(r2) = x2_lo * s
+    smultb  r8, r1, r2                 @ r8 = top16(r1) * bot16(r2) = x2_hi * s
     mul     r3, r3, r4                 @ r3 = c_lo * Q0I mod 2^32
     mul     r8, r8, r4                 @ r8 = c_hi * Q0I
     lsr     r3, r3, #16                @ r3 = h_lo
@@ -440,10 +441,10 @@ intti_vloop_packed:
     ssub16  r3, r7, r3                 @ r3 = canon-sub result
 
     @ Apply Plantard kernel to (s * canon-sub) per half → a[k2]
-    uxth    r8, r3
-    lsr     r12, r3, #16
-    mul     r8, r8, r2                 @ c_lo = s * sub_lo
-    mul     r12, r12, r2               @ c_hi
+    @ smulbb/smultb fuse the unpack+multiply (canon-sub result is in
+    @ [1..Q] < 2^15 ⇒ signed = unsigned).
+    smulbb  r8, r3, r2                 @ c_lo = s * sub_lo
+    smultb  r12, r3, r2                @ c_hi = s * sub_hi
     mul     r8, r8, r4                 @ c_lo * Q0I
     mul     r12, r12, r4
     lsr     r8, r8, #16                @ h_lo

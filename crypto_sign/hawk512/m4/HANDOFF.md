@@ -159,20 +159,42 @@ is an **instruction-count proxy**, not a cycle count. QEMU doesn't
 model the Cortex-M4 pipeline, dual-issue, flash wait states, prefetch,
 branch prediction, or load-use stalls. Real-silicon cycles will differ.
 
-**Packed v2 (current)** — uses `ldr.w`/`str.w` for 2-cell loads/stores
-and `uadd16`/`usub16`/`sel` for canonical [1..Q] add/sub. Falls back to
-scalar for the layer where each block has a single butterfly (NTT last
-layer, iNTT first layer):
+**Packed v2 (current)** — `ldr.w`/`str.w` for 2-cell load/store,
+`uadd16`/`usub16`/`sel` for canonical [1..Q] add/sub, **smulbb/smultb**
+fused unpack+multiply (safe because HAWK's Q < 2^15 so signed=unsigned
+on the operand halves; pattern borrowed from Pornin's
+`fndsa_provisional-512/m4f/mq_cm4.s`). Last layer (NTT) / first layer
+(iNTT) where each block has one butterfly falls back to scalar:
 
 | op   | logn          | C-ref | asm  | speedup |
 |------|---------------|-------|------|---------|
-| NTT  | 9 (HAWK-512)  | 1484  | 925  | 37%     |
-| iNTT | 9 (HAWK-512)  | 1644  | 1079 | 34%     |
-| NTT  | 10 (HAWK-1024)| 3257  | 2026 | 37%     |
-| iNTT | 10 (HAWK-1024)| 3615  | 2366 | 34%     |
+| NTT  | 9 (HAWK-512)  | 1484  | 874  | 41%     |
+| iNTT | 9 (HAWK-512)  | 1644  | 1028 | 37%     |
+| NTT  | 10 (HAWK-1024)| 3257  | 1911 | 41%     |
+| iNTT | 10 (HAWK-1024)| 3615  | 2251 | 37%     |
 
-**Scalar v1 (predecessor)** was 22% / 16% — packing added another
-~15 percentage points across both NTT and iNTT.
+Trajectory:
+  scalar v1   (Mar):  22% / 16%
+  packed v2   (May):  37% / 34%   (+15pp NTT / +18pp iNTT)
+  +smul fuse:         41% / 37%   (+4pp NTT / +3pp iNTT)
+
+**Cross-comparison with fndsa (Pornin's Falcon-derived NIST scheme,
+also in pqm4)**: fndsa uses `[0..Q-1]` canonical with signed packed
+ops (`sadd16`/`ssub16`/`sel`) → ~3 fewer cycles per packed pair than
+HAWK's `[1..Q]` canonical. Adopting fndsa's convention would break
+byte-identity with HAWK's KAT vectors, so we don't. fndsa's UMAAL
+trick (preserves Q0I in r14 across reductions) is mathematically
+elegant but slower than our scalar `mla` for HAWK's 16-bit Plantard
+(UMAAL is 3-5 cycles on M4 vs MLA's 1).
+
+**Further headroom**:
+- *Layer-merging* (3+3+2 style à la ml-dsa's smallntt_769.S): keeps
+  coefficients in registers across 2-3 layers, amortizes u-loop
+  overhead. Realistic estimate: +10pp NTT, +10pp iNTT → ~50%.
+- *Cross-block packed* for the ht=1 / t=1 layer (different twiddles
+  per half via `two_doublebutterfly_plant`-style): saves the scalar
+  fallback. Small win (~1-2pp).
+- *Real hardware*: only path to paper-quotable cycle counts.
 
 **How to quote these in a paper:**
 - ✅ "We observed an asm-vs-C *speedup ratio* of ~22% on QEMU mps2-an386 under -icount shift=0 (instruction-count proxy)."
