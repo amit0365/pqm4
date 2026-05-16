@@ -233,13 +233,42 @@ elegant but slower than our scalar `mla` for HAWK's 16-bit Plantard
 (UMAAL is 3-5 cycles on M4 vs MLA's 1).
 
 **Further headroom**:
-- *Layer-merging* (3+3+2 style à la ml-dsa's smallntt_769.S): keeps
-  coefficients in registers across 2-3 layers, amortizes u-loop
-  overhead. Realistic estimate: +10pp NTT, +10pp iNTT → ~50%.
 - *Cross-block packed* for the ht=1 / t=1 layer (different twiddles
   per half via `two_doublebutterfly_plant`-style): saves the scalar
   fallback. Small win (~1-2pp).
 - *Real hardware*: only path to paper-quotable cycle counts.
+
+**Layer-merging: tried, didn't pay off (2026-05-17)**
+
+A 2-layer merge for NTT lm=0+1 was implemented and verified
+byte-identical to the reference (logn 1..10), then rolled back.
+Measured gain on QEMU instruction proxy: **+0.75pp** (HAWK-512 NTT
+874 → 863 ticks). Far below the +10pp originally projected in the
+HANDOFF.
+
+Why the gain was small: HAWK Path B (canonical [1..Q] form) requires
+4 cycles per butterfly for the kernel reducer plus ~4 cycles for the
+canonical add/sub correction. The remaining ldr.w + str.w per
+butterfly is only ~2 cycles total when packed across 2 cells. Merging
+2 layers saves those inter-layer ldr/str cycles but the merged inner
+butterfly carries a twiddle-from-stack load (~2 extra cycles per
+butterfly) that eats half of the savings.
+
+Theoretical ceiling for stacking deeper merges (3-layer, 4-layer):
+- 3-layer: ~+1.5pp (intra-register butterflies for the innermost
+  layer add per-cell unpacking)
+- 4-layer: ~+2-3pp, dramatically harder (16 coefs in registers, M4
+  has 14 GPRs total)
+
+The 188-line diff for the 2-layer merge is preserved in git history
+on this branch — `git log --all --oneline | head` to find the
+experiment commit if anyone wants to revisit (e.g., when prepping
+for hardware bring-up to verify the QEMU-vs-silicon discrepancy isn't
+hiding additional savings).
+
+For the paper deliverable, the **41% / 37% packed v2.1 numbers** are
+the right level of optimization — well-balanced cycle/complexity
+tradeoff, easy to upstream, fully cross-checked end-to-end.
 
 **How to quote these in a paper:**
 - ✅ "We observed an asm-vs-C *speedup ratio* of ~22% on QEMU mps2-an386 under -icount shift=0 (instruction-count proxy)."
