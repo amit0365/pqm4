@@ -136,26 +136,44 @@ exactly on every input. Anything less is a spec violation.
 
 ## Plan (next iteration)
 
-Step 1 (lock the encoding) is done — see the table above. Remaining:
-
 1. ~~**Lock the encoding.**~~ ✅ — use `Q0I = 3955247103` with
    identity twiddle encoding; the existing `GM[]` / `iGM[]` tables
    are reusable as-is.
-2. **Implement `plant_18433.S`** (M4 asm) using the three-instruction
-   `mul / lsr / smlabt+rounding` reducer derived above, packed-pair
-   form via `smulwb / smulwt / smlabt / smlabt` for two coefficients
-   per butterfly. Layer-merge 2–3 layers per pass for register
-   residency.
-3. **Drop in NTT/iNTT replacements** behind a build flag
-   `HAWK_PLANT_NTT=1` (default off until we have on-target
-   measurements). The 15 call sites in `hawk_sign.c` get switched
-   en bloc.
-4. **Extend the cross-check test** to compare a full
+2. ~~**Drop in NTT/iNTT replacements behind `HAWK_PLANT_NTT=1`**~~ ✅
+   `plant_18433.{c,h}` provide externally-linkable
+   `mq18433_NTT_plant` / `mq18433_iNTT_plant` /
+   `mq18433_montymul_plant`. With `HAWK_PLANT_NTT=1` set,
+   `hawk_sign.c` re-routes all 15 call sites of `mq18433_*` to these
+   symbols via macro redefinition. With the flag unset, the upstream
+   static inlines are used (default behaviour).
+3. ~~**Extend the cross-check test** to compare a full
    `mq18433_NTT(a) / mq18433_iNTT(a)` byte-for-byte against the
-   Plantard versions over many random polynomials.
+   Plantard versions over many random polynomials.~~ ✅
+   `tests/test_plant_ntt.c` checks fwd NTT, inv NTT, and the
+   fwd+inv roundtrip across `logn ∈ {8, 9, 10}` with many random
+   polynomials each. Currently all `ALL TESTS PASSED` (the C
+   plant version IS the reference internally — by construction
+   byte-identical — so this is the ground truth the asm port has
+   to match).
+4. **Implement `plant_18433_cm4.S`** (M4 asm) using the
+   three-instruction `mul / lsr / smlatb+rounding` reducer locked
+   down above, packed-pair form via
+   `smulwb / smulwt / smlatb / smlatb` for two coefficients per
+   butterfly. Layer-merge 2–3 layers per pass for register
+   residency.
+   **Status**: not yet written. Requires ARM toolchain + M4
+   hardware to verify assembly and run the cross-check at all (no
+   ARM cross-compiler in the current dev environment). When the
+   `.S` file lands, it provides the same `mq18433_*_plant` symbols
+   as `plant_18433.c`; the build picks one or the other based on
+   target. The cross-check test in step 3 catches any byte-drift
+   immediately.
 5. **Benchmark on NUCLEO-L4R5ZI** using pqm4's `speed_test`
-   harness, compare to the upstream-C baseline.
+   harness, compare to the upstream-C baseline. Target:
+   sign-512 < 500 k cycles, verify-512 < 300 k cycles.
 
-Until step 2 lands, **`hawk_sign.c` keeps calling upstream
-`mq18433_*`** — current commit is design + calibration only,
-behaviour is unchanged.
+`hawk_sign.c` ships with `HAWK_PLANT_NTT` undefined by default, so
+the production path remains upstream `mq18433_*`. Defining the flag
+(`-DHAWK_PLANT_NTT=1` in `crypto_sign/hawk512/m4/config.mk` or via
+the make command line) flips it on once on-target measurements
+justify the switch.

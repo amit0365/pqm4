@@ -6,6 +6,19 @@
 #define Q   18433
 #include "modq.h"
 
+/* Plantard-style NTT path (off by default). When HAWK_PLANT_NTT is
+ * defined to a non-zero value, the three hot mq18433_* entry points
+ * are routed through the external symbols provided by plant_18433.c
+ * (portable C, byte-identical to mq18433_*) or, on Cortex-M4 builds,
+ * by plant_18433_cm4.S (hand-scheduled asm to come). See
+ * PLANTARD_NOTES.md for the locked-down kernel design. */
+#if defined(HAWK_PLANT_NTT) && HAWK_PLANT_NTT
+#include "plant_18433.h"
+#define mq18433_NTT       mq18433_NTT_plant
+#define mq18433_iNTT      mq18433_iNTT_plant
+#define mq18433_montymul  mq18433_montymul_plant
+#endif
+
 /*
  * Binary polynomials (GF(2)[X]); inputs a and b have size N bits;
  * output d has size N or 2*N bits, depending on the operation:
