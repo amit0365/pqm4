@@ -286,6 +286,38 @@ is "uint16 modulo 2¹⁶, congruent to the true value mod Q",
 `[0, 2¹⁶)` between layers; the invariant kept across layers
 is modular equivalence mod Q, not a centred range.
 
+### Why ml-dsa's wrap arithmetic doesn't apply to HAWK
+
+The `uadd16` trick **only preserves mod-Q residue when no
+actual wrap occurs**. A wrap by 2¹⁶ shifts the residue by
+`2¹⁶ mod Q` — a nonzero offset that silently corrupts the
+math.
+
+  - ml-dsa: `q = 769`, `2¹⁶ mod q = 171`. Their coefficients
+    are bounded by a few `q`s (~2¹¹), so `x + y` for any
+    pair never reaches 2¹⁶ — wraps simply don't happen, and
+    `uadd16` is exact integer add for them.
+  - HAWK: `Q = 18433`, `2¹⁶ mod Q = 10237`. Initial canonical
+    values fit `[1..Q]≈[1..2¹⁴]`. After **one butterfly**, the
+    sum `x1 + x2` can reach `2·Q ≈ 36866 < 2¹⁶`, still safe.
+    But after `x2 = plant_red(...) ∈ [1..Q]` is added to a
+    previous-layer's wrap-form `x1` (which could already be
+    in `[0, 2¹⁶)`), the sum overflows 2¹⁶ regularly. Each
+    such wrap injects `+10237` into the running residue.
+
+A single host-side check verifies the math
+(`/tmp/dbg_wrap.c`):
+
+    x = 50000  // wrap form, represents 13134 mod Q
+    y = 18000  // canonical, mod Q is 18000
+    true (x + y) mod Q = 12701
+    uint16-wrap (x + y) = 2464, that mod Q = 2464
+    offset introduced by the wrap = -10237 (= -(2¹⁶ mod Q))
+
+So ml-dsa-style lazy-reduce Plantard isn't a drop-in for
+HAWK's modulus. The constraint is `magnitude < 2¹⁶`, and
+HAWK's `Q ≈ 2¹⁴` lets a single butterfly add break it.
+
 ### Why my Path A attempt failed (root cause)
 
 My C attempt cast cells to `int16_t` (sign-extending any cell
@@ -320,64 +352,86 @@ equality" (e.g., compare `mq18433_NTT(w);  pointwise;
 mq18433_iNTT(w)` against `mq18433_NTT_plant(w);  pointwise_plant;
 mq18433_iNTT_plant(w)`, byte-equal at the end).
 
+## Updated recommendation (after experiment a)
+
+ml-dsa's Plantard NTT architecture (lazy reduction with
+uint16-wrap arithmetic) **does not directly port to HAWK**
+because HAWK's `Q ≈ 2¹⁴` is too large relative to the 2¹⁶
+storage width: wraps happen routinely, and each wrap injects
+a `2¹⁶ mod Q = 10237` offset into the mod-Q residue. A
+HAWK-specific Plantard variant would need one of:
+
+  - **Wider intermediate storage (int32 / uint32 per
+    coefficient)**: no wrap issue, but the packed-pair
+    `smulwb / smulwt` advantage is gone (one coefficient per
+    register instead of two). Per-butterfly cycle count grows
+    proportionally; the asm port is no longer dramatically
+    faster than the reference C.
+  - **Per-layer canonical reduction (= Path B)**: each
+    butterfly's add/sub reduces to canonical `[1..Q]`. The C
+    body becomes byte-identical to `Zq(NTT)` by construction;
+    the asm benefits only from the packed-pair `plant_red`
+    twiddle multiply, not from the running-state packing. Cycle
+    count is ~Path-B from the earlier analysis (~25 % slower
+    than Path A would have been).
+  - **A novel reduction algorithm** tuned for HAWK's specific
+    modulus (e.g., signed Plantard with explicit overflow
+    handling, or a variant of Solinas / Barrett that exploits
+    `Q = 2¹⁴ + 2¹¹ + 1`). This is research; not appropriate
+    for a single-paper deliverable.
+
+**Pragmatic recommendation for the v1 paper**: take **Path B**.
+Accept the ~25 % cycle cost relative to the (hypothetical) Path
+A. The numbers should still beat the reference-C baseline by a
+substantial margin because the asm gets to use the `plant_red`
+twiddle multiply (which is the actual algorithmic win — 2-3
+instructions per coefficient versus ~6-7 for the C `montymul`)
+even when the running state is canonical. The packed-pair
+register residency is what we give up, not the reduction
+algorithm itself.
+
+A v2 paper can revisit Path A using one of the routes above
+(wider storage, or research) if the v1 numbers warrant the
+follow-up.
+
 ## Plan (next iteration)
 
-Path A is the right direction (~25 % faster than Path B per the
-earlier analysis); experiment (a) above shows ml-dsa already
-proves it's viable. My in-tree C attempt failed for a specific
-reason now understood (`int16_t` cast instead of `uint16_t` wrap
-arithmetic). Concrete next steps:
+Take Path B for HAWK-m4 v1. Concrete steps:
 
-1. ~~Lock the kernel encoding (`Q0I = 3955247103`, qa = `1<<16`
-   for monty-byte-equality or qa = `Q` for ml-dsa-style Plantard).~~ ✅
+1. ~~Lock the kernel encoding (`Q0I = 3955247103`, `qa = 1<<16`).~~ ✅
 
 2. ~~Wire `HAWK_PLANT_NTT=1` macro layer into `hawk_sign.c`.~~ ✅
 
 3. ~~Cross-check infrastructure (`tests/test_plant_ntt.c`).~~ ✅
+   Currently byte-identical-by-construction (the C `plant_*`
+   functions are line-for-line copies of `Zq(*)`). That's the
+   right state for Path B.
 
-4. **Rewrite `plant_18433.c` for uint16-wrap arithmetic** (per
-   experiment (a)). All cells are `uint16_t`; add/sub via
-   `(uint16_t)(a + b)` and `(uint16_t)(a - b)`. `plant_red`
-   returns a `uint16_t` to be stored directly (no signed cast).
-   The C reference no longer mirrors `Zq(NTT)` line-for-line —
-   it mirrors the **asm's** semantics (so it'll match the asm
-   byte-for-byte, but not the reference NTT byte-for-byte).
+4. **Write the M4 asm** `plant_18433_cm4.S` using:
+     - canonical `[1..Q]` cells throughout (storage matches HAWK
+       expectations; the existing cross-check at NTT boundaries
+       remains byte-for-byte),
+     - the locked-down 3-instruction `mul / lsr / smlatb`
+       `plant_red` kernel (byte-identical to `Zq(montyred)` per
+       calibration),
+     - explicit canonical add/sub at each butterfly — about 5
+       instructions per packed half for the conditional-`+Q`
+       adjustment (`usub16 / sel / uadd16 / usub16`-style on
+       Cortex-M4).
 
-5. **Write the Plantard-aware pointwise helpers**:
-   `mq18433_montymul_plant`, `mq18433_sub_plant`,
-   `mq18433_tomonty_plant`, plus the composed
-   `mq18433_compose_plant(w2, w3, w1)` that mirrors the
-   `tomonty(sub(montymul(w2, w3), w1))` chain in
-   `hawk_sign.c:1098-1101` — analog of ml-dsa's
-   `small_asymmetric_mul`.
+   Without packed-pair register residency, each butterfly is
+   ~8–10 instructions instead of Path A's ~5.5; expect about
+   3-4× speedup over the reference C `mq18433_NTT`, not the
+   ~5× Path A would have given.
 
-6. **Adjust the cross-check** to test **pipeline-level**
-   byte equality, not per-NTT:
+5. **Benchmark on NUCLEO-L4R5ZI** using pqm4's `speed_test`
+   harness; compare to the upstream-C baseline and to ml-dsa
+   numbers as a sanity check.
 
-   ```c
-   /* Reference pipeline (canonical math throughout). */
-   mq18433_NTT(logn, w1); mq18433_NTT(logn, w2);
-   for (u..) w1[u] = mq18433_montymul(w1[u], w2[u]);
-   mq18433_iNTT(logn, w1);
-
-   /* Plant pipeline (Plantard math, canonical only at exit). */
-   mq18433_NTT_plant(logn, w1p); mq18433_NTT_plant(logn, w2p);
-   for (u..) w1p[u] = mq18433_montymul_plant(w1p[u], w2p[u]);
-   mq18433_iNTT_plant(logn, w1p);
-   /* No extra normalise — iNTT_plant ends in canonical form. */
-
-   memcmp(w1, w1p) == 0;  // byte equality at the boundary
-   ```
-
-   Same boundary as ml-dsa: enter canonical, leave canonical,
-   stay in Plantard form between.
-
-7. **Implement `plant_18433_cm4.S`** by adapting ml-dsa's
-   `smallntt_769.S`: substitute `q=18433`, `qa` per choice, the
-   Plantard-encoded twiddle table generated from HAWK's `GM[]`,
-   and add the extra layer-group for `n=512` / `n=1024`.
-
-8. **Benchmark on NUCLEO-L4R5ZI**.
+6. **v2 paper (deferred)**: explore wider-storage Plantard
+   (int32 cells) or a HAWK-specific reduction to recover the
+   Path A speedup. This is research, not engineering — defer
+   until v1 lands.
 
 `hawk_sign.c` ships with `HAWK_PLANT_NTT` undefined by default,
 so the production path remains upstream `mq18433_*`. The flag
