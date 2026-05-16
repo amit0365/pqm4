@@ -191,6 +191,70 @@ The choice is a perf/intrusiveness tradeoff; either honours the
 HAWK spec because the cross-check test (`test_plant_ntt.c`) will
 catch any byte-drift in the integrated NTT output.
 
+## Path A attempt — what failed and why
+
+(Recorded so the next iteration doesn't repeat the dead end.)
+
+I tried implementing Path A in C: signed Plantard reduction
+`plant_red(c)` keeping coefficients in centred form `[-Q, Q]`,
+plus a normalisation pass at NTT exit. The single-coefficient
+plant_red was correct against `mq18433_montymul` (a separate
+test, `dbg_plant.c`, ran clean over 50 random `(a, b)` pairs).
+The 2-layer NTT (`n=4`) also matched byte-for-byte after
+normalisation.
+
+But for `n=256` the byte-equality test failed at layer 1
+onward: ~12 positions diverged after layer 1 (always by `±1`),
+growing to ~all 256 positions by layer 6. The values
+**weren't even congruent mod Q** (`12382` vs `3362`, diff `9020`
+which isn't a multiple of `Q=18433`).
+
+Switching `plant_red` to *unsigned* arithmetic (literally
+`Zq(montyred)` inlined) didn't fix it — the failure mode
+changed but the test still failed with non-congruent diffs.
+The bug isn't in `plant_red`: I verified `plant_red` returns
+the same value as `montyred` for `int32` inputs in
+`{1, -1, ±100, ±1000, ±5000, ±Q, ±100·Q, ±Q²/2}` and for
+`±x · twiddle` pairs that are mod-Q equivalents.
+
+So the bug is somewhere in the butterfly's combination of
+`plant_red` output with the running centred state — likely in
+`centred_reduce` interacting with the signed/unsigned read of
+storage cells, or in `to_canonical`'s representative choice
+when the centred value lands on a boundary. I couldn't
+isolate it in this iteration without an ARM toolchain and
+on-target verification to corroborate.
+
+**Reverted to the byte-identical-by-construction baseline.**
+`plant_18433.c` is once again line-for-line `Zq(NTT)` /
+`Zq(iNTT)` (the cross-check passes trivially). This is
+effectively the **Path B** structural choice for the C path,
+even though the test now is just verifying our wiring, not
+exercising any speedup.
+
+### Open question for the next iteration
+
+Is the signed-shift rounding fundamentally incompatible with
+HAWK's spec, or is there a subtle bug in the
+`centred_reduce` / `to_canonical` / storage-cell-cast triplet?
+
+Two concrete experiments to disambiguate:
+
+  1. Run pqm4's existing `small_ntt_asm_769` (ml-dsa Plantard
+     NTT) on hardware against a coefficient-by-coefficient
+     reference, see if it claims byte-identity or only
+     "byte-identity after the post-NTT pointwise pipeline".
+     If the latter, that confirms signed Plantard is
+     inherently mid-NTT-divergent and HAWK has to either
+     adopt the same post-NTT-pipeline semantics or stay on
+     Path B.
+
+  2. Try a C version of Path A where the per-butterfly
+     storage uses `int16_t a[]` directly (not a `uint16_t`
+     bit-cast). That eliminates any sign-extension ambiguity
+     on cell read/write and would isolate whether the bug is
+     in the cast or in the math.
+
 ## Plan (next iteration)
 
 1. ~~**Lock the encoding.**~~ ✅ — use `Q0I = 3955247103` with
