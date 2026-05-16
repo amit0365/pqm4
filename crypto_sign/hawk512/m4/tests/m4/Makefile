@@ -67,7 +67,7 @@ SMOKE_CFLAGS = $(CFLAGS) -DHAWK_PLANT_NTT=1 -Istubs -I$(SRC_DIR) \
 SMOKE_LDFLAGS = $(LDFLAGS)
 
 smoke_%.o: $(SRC_DIR)/%.c
-	$(CC) $(SMOKE_CFLAGS) -c $< -o $@
+	$(CC) $(SMOKE_CFLAGS) -DHAWK_MP_ASM_CORTEXM4=1 -c $< -o $@
 
 libc_stubs.o: libc_stubs.c
 	$(CC) $(CFLAGS) -c libc_stubs.c -o $@
@@ -165,7 +165,7 @@ PROF_WRAPS = -Wl,--wrap=mq18433_NTT_plant \
 prof_hawk_sign.o: $(SRC_DIR)/hawk_sign.c
 	$(CC) $(SMOKE_CFLAGS) -DHAWK_PROFILE=1 -c $< -o $@
 prof_hawk_vrfy.o: $(SRC_DIR)/hawk_vrfy.c
-	$(CC) $(SMOKE_CFLAGS) -DHAWK_PROFILE=1 -c $< -o $@
+	$(CC) $(SMOKE_CFLAGS) -DHAWK_PROFILE=1 -DHAWK_MP_ASM_CORTEXM4=1 -c $< -o $@
 prof_ng_hawk.o: $(SRC_DIR)/ng_hawk.c
 	$(CC) $(SMOKE_CFLAGS) -DHAWK_PROFILE=1 -c $< -o $@
 

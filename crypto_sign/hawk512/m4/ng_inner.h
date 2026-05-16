@@ -460,10 +460,29 @@ mp_half(uint32_t a, uint32_t p)
 static inline uint32_t
 mp_montymul(uint32_t a, uint32_t b, uint32_t p, uint32_t p0i)
 {
+#if defined(HAWK_MP_ASM_CORTEXM4) && HAWK_MP_ASM_CORTEXM4 \
+    && defined(__ARM_ARCH_7EM__) && defined(__ARM_FEATURE_DSP) && __ARM_FEATURE_DSP
+	/* See hawk_vrfy.c for full citation. Pattern from Pornin's
+	 * eprint 2025/123 (Falcon-M4), generic 32-bit Montgomery,
+	 * applied here to ng_inner.h's mp_montymul (used by the NTRU
+	 * keygen solver via solve_NTRU). */
+	uint32_t d;
+	__asm__(
+		"umull	%0, %2, %0, %1\n\t"
+		"mul	%1, %0, %4\n\t"
+		"umlal	%0, %2, %1, %3\n\t"
+		"sub.w	%2, %2, %3\n\t"
+		"and	%0, %3, %2, asr #31\n\t"
+		"add.w	%2, %2, %0"
+		: "+r" (a), "+r" (b), "=&r" (d)
+		: "r" (p), "r" (p0i));
+	return d;
+#else
 	uint64_t z = (uint64_t)a * (uint64_t)b;
 	uint32_t w = (uint32_t)z * p0i;
 	uint32_t d = (uint32_t)((z + (uint64_t)w * (uint64_t)p) >> 32) - p;
 	return d + (p & tbmask(d));
+#endif
 }
 
 /*

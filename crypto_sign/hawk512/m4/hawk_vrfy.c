@@ -62,10 +62,49 @@ mp_sub(uint32_t a, uint32_t b, uint32_t p)
 static inline uint32_t
 mp_montymul(uint32_t a, uint32_t b, uint32_t p, uint32_t p0i)
 {
+#if defined(HAWK_MP_ASM_CORTEXM4) && HAWK_MP_ASM_CORTEXM4 \
+    && defined(__ARM_ARCH_7EM__) && defined(__ARM_FEATURE_DSP) && __ARM_FEATURE_DSP
+	/* 6-instruction 32-bit Montgomery multiplication on Cortex-M4.
+	 *
+	 * Pattern adapted from T. Pornin's inline asm for the equivalent
+	 * routine in fndsa_provisional-512/m4f/kgen_inner.h, originally
+	 * published in "Falcon on ARM Cortex-M4: an Update" (eprint
+	 * 2025/123, January 2025). The reduction algorithm is generic
+	 * 32-bit Montgomery — the same pattern works for any 31-bit
+	 * prime p including HAWK's verify-path moduli (2147473409 and
+	 * 2147389441). For HAWK specifically, both primes are of the
+	 * 2^31 - δ form (δ < 2^17), which would in principle admit
+	 * Solinas-style reduction; in practice Pornin's 6-instruction
+	 * generic Montgomery is tied or faster on Cortex-M4 because the
+	 * `umlal` + `umull` instructions execute in one cycle on this
+	 * core, making the generic-Montgomery instruction count near-
+	 * optimal.
+	 *
+	 *   umull  r_lo, r_hi, a, b            ; {hi:lo} = a*b
+	 *   mul    w, r_lo, p0i                ; w = (a*b mod 2^32) * p0i
+	 *   umlal  r_lo, r_hi, w, p            ; {hi:lo} += w*p
+	 *                                      ; high 32 = (a*b + w*p) >> 32
+	 *   sub.w  r_hi, r_hi, p               ; canonicalize toward [0..p-1]
+	 *   and    r_lo, p, r_hi, asr #31      ; r_lo = p if r_hi negative, else 0
+	 *   add.w  r_hi, r_hi, r_lo            ; conditional add p
+	 */
+	uint32_t d;
+	__asm__(
+		"umull	%0, %2, %0, %1\n\t"
+		"mul	%1, %0, %4\n\t"
+		"umlal	%0, %2, %1, %3\n\t"
+		"sub.w	%2, %2, %3\n\t"
+		"and	%0, %3, %2, asr #31\n\t"
+		"add.w	%2, %2, %0"
+		: "+r" (a), "+r" (b), "=&r" (d)
+		: "r" (p), "r" (p0i));
+	return d;
+#else
 	uint64_t z = (uint64_t)a * (uint64_t)b;
 	uint32_t w = (uint32_t)z * p0i;
 	uint32_t d = (uint32_t)((z + (uint64_t)w * (uint64_t)p) >> 32) - p;
 	return d + (p & tbmask(d));
+#endif
 }
 
 /*
