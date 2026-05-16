@@ -146,9 +146,31 @@ Cortex-M4 ELF for QEMU `mps2-an386` board with semihosting. Run via:
 ```
 make -C crypto_sign/hawk512/m4/tests/m4 run        # montymul test
 make -C crypto_sign/hawk512/m4/tests/m4 run-ntt    # NTT + iNTT test
+make -C crypto_sign/hawk512/m4/tests/m4 run-bench  # asm vs C-ref benchmark
 ```
 Requires `arm-none-eabi-gcc` and `qemu-system-arm` (both available via
 homebrew on macOS).
+
+**Benchmark results (QEMU, SysTick proxy under -icount shift=0)**:
+
+| op   | logn | C-ref | asm  | speedup |
+|------|------|-------|------|---------|
+| NTT  | 6    | 133   | 102  | 23%     |
+| iNTT | 6    | 145   | 120  | 17%     |
+| NTT  | 9 (HAWK-512)  | 1483  | 1154 | 22%     |
+| iNTT | 9 (HAWK-512)  | 1643  | 1372 | 16%     |
+| NTT  | 10 (HAWK-1024) | 3257  | 2536 | 22%     |
+| iNTT | 10 (HAWK-1024) | 3615  | 3023 | 16%     |
+
+Numbers are SysTick ticks under `-icount shift=0` — roughly 40 emulated
+instructions per tick on mps2-an386. NOT pipeline-accurate (QEMU doesn't
+model M4 dual-issue, flash waits, or prefetch). The RATIOS should
+track real-silicon RATIOS reasonably well; absolute numbers won't.
+
+**Caveat**: ~20% is the modest-scalar-asm ceiling. Compiler-generated
+C with inlined montymul/add/sub already runs ~21-25 instructions per
+butterfly, and our scalar asm shaves ~3-5 instructions. The 3-4× target
+in the original design needs packed-pair (see v2 below).
 
 **Next: packed-pair optimization (v2)**. The scalar version is correct but
 modest in speedup — roughly parity with inlined C, since the per-butterfly
