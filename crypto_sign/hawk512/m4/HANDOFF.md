@@ -159,6 +159,21 @@ is an **instruction-count proxy**, not a cycle count. QEMU doesn't
 model the Cortex-M4 pipeline, dual-issue, flash wait states, prefetch,
 branch prediction, or load-use stalls. Real-silicon cycles will differ.
 
+**Packed v2 (current)** — uses `ldr.w`/`str.w` for 2-cell loads/stores
+and `uadd16`/`usub16`/`sel` for canonical [1..Q] add/sub. Falls back to
+scalar for the layer where each block has a single butterfly (NTT last
+layer, iNTT first layer):
+
+| op   | logn          | C-ref | asm  | speedup |
+|------|---------------|-------|------|---------|
+| NTT  | 9 (HAWK-512)  | 1484  | 925  | 37%     |
+| iNTT | 9 (HAWK-512)  | 1644  | 1079 | 34%     |
+| NTT  | 10 (HAWK-1024)| 3257  | 2026 | 37%     |
+| iNTT | 10 (HAWK-1024)| 3615  | 2366 | 34%     |
+
+**Scalar v1 (predecessor)** was 22% / 16% — packing added another
+~15 percentage points across both NTT and iNTT.
+
 **How to quote these in a paper:**
 - ✅ "We observed an asm-vs-C *speedup ratio* of ~22% on QEMU mps2-an386 under -icount shift=0 (instruction-count proxy)."
 - ✅ As directional / ordering evidence: "asm is faster than C reference".

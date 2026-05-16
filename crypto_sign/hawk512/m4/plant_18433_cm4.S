@@ -109,29 +109,36 @@ mq18433_montymul_plant:
 @ -------------------------------------------------------------------
 @ void mq18433_NTT_plant(unsigned logn, uint16_t *a);
 @
-@ Cooley-Tukey forward NTT, scalar (v1). Mirrors Zq(NTT) in modq.h
-@ exactly: same loop structure, same per-coefficient kernel + canonical
-@ [1..Q] add/sub.
+@ Cooley-Tukey forward NTT. Path B canonical-form throughout.
 @
-@ Register map (callee-saved r4-r11 + lr; sub sp #8 for u counter):
-@   r0,r1   x1,x2 (inner loop scratch)
+@ Layer structure split:
+@   - Layers with ht >= 2 (HT_bytes >= 4): PACKED-PAIR inner loop
+@     processes 2 butterflies (4 cells) per iter via ldr.w/str.w +
+@     uadd16/usub16/sel.
+@   - Last layer (ht = 1, HT_bytes = 2): scalar fallback. Can't pack
+@     within a block (only one butterfly per block); cross-block pack
+@     is a v3 optimization.
+@
+@ Register map (callee-saved r4-r11 + lr; sub sp #16 for spills):
+@   r0,r1   x1,x2 packed (inner) / scratch elsewhere
 @   r2      s    (twiddle, loaded *p_GM++ at each u-iter)
-@   r3      scratch (canonical-add result)
+@   r3,r8,r12  inner scratch (3 regs)
 @   r4      Q0I = 0xEBC047FF
 @   r5      Q   = 18433
 @   r6      QA  = 0x10000
-@   r7      a_base (function argument)
-@   r8      p_GM (advances through &mq18433_GM[1..N-1] across all layers)
-@   r9      T_bytes (block stride in bytes; halves each layer)
-@   r10     m  (block count; doubles each layer)
-@   r11     p_k1 (inner pointer, post-incremented by 2 per butterfly)
-@   r12     p_k2 (inner pointer, post-incremented by 2 per butterfly)
-@   r14     v_remaining (inner counter, decrements to 0)
-@   [sp+0]  u_remaining (across u-iter)
+@   r7      Q_packed   = (Q   << 16) | Q
+@   r9      HT_bytes   (per-layer; halves each layer; loop bound)
+@   r10     Qp1_packed = ((Q+1) << 16) | (Q+1)
+@   r11     p_k1
+@   r14     v_remaining
+@   [sp+0]  u_remaining
+@   [sp+4]  a_base
+@   [sp+8]  m_current
+@   [sp+12] p_GM (spilled here because r8 is needed as inner scratch)
 @
-@ Loop bound: T_bytes starts at 2*N (= 2<<logn), halves each layer.
-@ Last layer has T_bytes=4 (single-butterfly blocks). After the post-
-@ layer halve, T_bytes=2 ⇒ done.
+@ Loop bound: HT_bytes starts at N bytes (= 1 << logn), halves each
+@ layer. Last layer has HT_bytes=2. After post-layer halve, HT_bytes=1
+@ ⇒ done.
 @ -------------------------------------------------------------------
     .global mq18433_NTT_plant
     .type   mq18433_NTT_plant, %function
@@ -139,93 +146,174 @@ mq18433_montymul_plant:
     .align  2
 mq18433_NTT_plant:
     push    {r4-r11, lr}
-    sub     sp, sp, #8                 @ [sp+0] = u_remaining; [sp+4] = pad
+    sub     sp, sp, #16
 
-    @ Load constants
+    @ Load scalar constants
     movw    r4, #0x47FF
     movt    r4, #0xEBC0                @ r4 = Q0I
     movw    r5, #18433                 @ r5 = Q
     mov.w   r6, #0x10000               @ r6 = QA
 
-    mov     r7, r1                     @ r7 = a_base
+    @ Packed constants
+    pkhbt   r7, r5, r5, lsl #16        @ r7 = Q_packed = (Q << 16) | Q
+    adds    r3, r5, #1                 @ r3 = Q + 1
+    pkhbt   r10, r3, r3, lsl #16       @ r10 = Qp1_packed
 
-    movw    r8, #:lower16:mq18433_GM
-    movt    r8, #:upper16:mq18433_GM
-    adds    r8, r8, #2                 @ r8 = &mq18433_GM[1] (skip GM[0])
+    @ Spill a_base
+    str     r1, [sp, #4]
 
-    @ T_bytes = 2 << logn
-    movs    r9, #2
-    lsls    r9, r9, r0                 @ r9 = T_bytes
+    @ Initialize p_GM = &mq18433_GM[1] (skip GM[0]; the table is read in
+    @ order: GM[1] for the (m=1) layer, GM[2..3] for (m=2), etc.).
+    movw    r3, #:lower16:mq18433_GM
+    movt    r3, #:upper16:mq18433_GM
+    adds    r3, r3, #2
+    str     r3, [sp, #12]              @ stash p_GM on stack
 
-    @ m = 1
-    movs    r10, #1
+    @ HT_bytes_initial = 1 << logn (N bytes — i.e., (N halfwords)*1
+    @ given ht = N/2 halfwords ⇒ ht_bytes = N bytes)
+    movs    r9, #1
+    lsls    r9, r9, r0                 @ r9 = HT_bytes_initial
+
+    @ m_initial = 1
+    movs    r3, #1
+    str     r3, [sp, #8]               @ stash m on stack
 
 ntt_layer:
+    cmp     r9, #2
+    blt     ntt_done                   @ HT_bytes < 2 ⇒ done
+
+    @ Layer setup: p_k1 = a_base, u_remaining = m
+    ldr     r11, [sp, #4]              @ p_k1 = a_base
+    ldr     r3, [sp, #8]
+    str     r3, [sp, #0]               @ u_remaining = m
+
+    @ Branch: HT_bytes >= 4 ⇒ packed; HT_bytes == 2 ⇒ scalar
     cmp     r9, #4
-    blt     ntt_done                   @ T_bytes < 4 means we're past the last layer
+    blt     ntt_uloop_scalar
 
-    @ p_k1 = a_base; HT_bytes = T_bytes >> 1; p_k2 = p_k1 + HT_bytes
-    mov     r11, r7
-    lsr     r0, r9, #1                 @ r0 = HT_bytes
-    add     r12, r11, r0
-
-    @ u_remaining = m
-    str     r10, [sp, #0]
-
-ntt_uloop:
+@ ---------- PACKED u-loop (ht >= 2) ----------
+ntt_uloop_packed:
+    @ Reload p_GM, fetch s, save advanced p_GM
+    ldr     r8, [sp, #12]
     ldrh    r2, [r8], #2               @ r2 = s = *p_GM++
-    lsr     r14, r9, #2                @ r14 = v_remaining = HT_halfwords = T_bytes/4
+    str     r8, [sp, #12]
 
-ntt_vloop:
-    @ Butterfly: x1 = a[k1]; x2 = a[k2]; x2' = montymul(x2, s)
-    @            a[k1] = add(x1, x2'); a[k2] = sub(x1, x2')
-    ldrh    r0, [r11]                  @ r0 = x1 = a[k1]
-    ldrh    r1, [r12]                  @ r1 = a[k2]
+    @ v_remaining (packed) = ht/2 = HT_bytes/4
+    lsr     r14, r9, #2
 
-    @ Inner Plantard kernel (= Zq(montyred)(a[k2] * s))
-    mul     r1, r1, r2                 @ r1 = c = a[k2] * s
-    mul     r1, r1, r4                 @ r1 = t = c * Q0I (low 32)
-    lsr     r1, r1, #16                @ r1 = h
-    mla     r1, r1, r5, r6             @ r1 = h*Q + QA
-    lsr     r1, r1, #16                @ r1 = x2' (in [1..Q])
+ntt_vloop_packed:
+    @ Load packed x1 and x2 (2 cells each)
+    ldr.w   r0, [r11]                  @ r0 = x1 = (x1_hi << 16) | x1_lo
+    ldr.w   r1, [r11, r9]              @ r1 = x2 (offset HT_bytes from p_k1)
 
-    @ Canonical add: r3 = (x1 + x2'); if > Q, sub Q
+    @ Plantard kernel applied to each half of x2 separately.
+    @ Cannot pack because c_i = x2_i * s is up to 30 bits per cell.
+    uxth    r3, r1                     @ r3 = x2_lo
+    lsr     r8, r1, #16                @ r8 = x2_hi
+    mul     r3, r3, r2                 @ r3 = c_lo  = x2_lo * s
+    mul     r8, r8, r2                 @ r8 = c_hi
+    mul     r3, r3, r4                 @ r3 = c_lo * Q0I mod 2^32
+    mul     r8, r8, r4                 @ r8 = c_hi * Q0I
+    lsr     r3, r3, #16                @ r3 = h_lo
+    lsr     r8, r8, #16                @ r8 = h_hi
+    mla     r3, r3, r5, r6             @ r3 = h_lo*Q + QA
+    mla     r8, r8, r5, r6             @ r8 = h_hi*Q + QA
+    lsr     r3, r3, #16                @ r3 = reduced_lo  in [1..Q]
+    lsr     r8, r8, #16                @ r8 = reduced_hi  in [1..Q]
+    pkhbt   r1, r3, r8, lsl #16        @ r1 = (reduced_hi << 16) | reduced_lo
+
+    @ Canonical add: per half, if (x1+m) > Q subtract Q.
+    @   sum  = uadd16(x1, m)                 ; in [2..2Q] per half, no overflow
+    @   chk  = usub16(sum, Q+1)              ; GE_h set if sum_h > Q
+    @   sub_ = usub16(sum, Q)                ; sum - Q per half
+    @   res  = sel(sub_, sum)                ; GE → sub_; else sum
+    uadd16  r3, r0, r1                 @ r3 = sum
+    usub16  r8, r3, r7                 @ r8 = sum - Q
+    usub16  r12, r3, r10               @ r12 = sum - (Q+1), GE flags
+    sel     r8, r8, r3                 @ r8 = canon-add result
+    str.w   r8, [r11]                  @ a[k1..k1+1] = canon-add result
+
+    @ Canonical sub: per half, x1 - m mod Q in [1..Q] with 0 ⇒ Q.
+    @ Sequence (using only USUB16's "no-borrow" flag is hard because
+    @ the following UADD16 clobbers GE; instead we use UADD16's
+    @ overflow GE flag, which is set precisely when the USUB16 had a
+    @ borrow — i.e., m < x1):
+    @
+    @   y      = usub16(m, x1)             ; m - x1 (uint16 wrap)
+    @   y_plus = uadd16(y,  Q_packed)      ; y + Q. Overflows iff y wrapped,
+    @                                        which is iff x1 > m. GE set on overflow.
+    @   yp     = sel(y_plus, y)            ; GE set (x1>m)  → y_plus (wrap-corrected)
+    @                                        GE clear (m>=x1)→ y       (already in [0..Q-1])
+    @   res    = ssub16(Q_packed, yp)      ; per-half Q - yp  ⇒ [1..Q] (Q for yp=0)
+    usub16  r3, r1, r0
+    uadd16  r8, r3, r7
+    sel     r3, r8, r3
+    ssub16  r3, r7, r3
+    str.w   r3, [r11, r9]              @ a[k2..k2+1] = canon-sub result
+
+    @ Advance p_k1 by 4 bytes (2 halfwords = next packed pair)
+    adds    r11, r11, #4
+    subs    r14, r14, #1
+    bne     ntt_vloop_packed
+
+    @ End of packed v-loop: r11 advanced by HT_bytes from block start
+    @ (HT_bytes/4 iters × 4 bytes). Next block starts at +HT_bytes
+    @ further, so add r9.
+    add     r11, r11, r9
+
+    @ u_remaining--
+    ldr     r0, [sp, #0]
+    subs    r0, r0, #1
+    str     r0, [sp, #0]
+    bne     ntt_uloop_packed
+    b       ntt_layer_done
+
+@ ---------- SCALAR u-loop (ht == 1, last layer) ----------
+@ One butterfly per block, k2 = k1 + 2 bytes.
+ntt_uloop_scalar:
+    ldr     r8, [sp, #12]
+    ldrh    r2, [r8], #2
+    str     r8, [sp, #12]
+
+ntt_v_scalar_one:
+    @ Single scalar butterfly at p_k1=k1, k2=p_k1+2.
+    ldrh    r0, [r11]                  @ x1
+    ldrh    r1, [r11, #2]              @ x2
+
+    mul     r1, r1, r2
+    mul     r1, r1, r4
+    lsr     r1, r1, #16
+    mla     r1, r1, r5, r6
+    lsr     r1, r1, #16                @ r1 = montymul'd x2
+
     add     r3, r0, r1
     cmp     r3, r5
     it      hi
     subhi   r3, r3, r5
 
-    @ Canonical sub: r0 = (x1 - x2') (signed); if <= 0, add Q
     subs    r0, r0, r1
     it      le
     addle   r0, r0, r5
 
-    strh    r3, [r11], #2              @ a[k1] = add result
-    strh    r0, [r12], #2              @ a[k2] = sub result
+    strh    r3, [r11], #2              @ a[k1]
+    strh    r0, [r11], #2              @ a[k2]; r11 now at next block start
 
-    subs    r14, r14, #1
-    bne     ntt_vloop
-
-    @ End of v-loop: advance pointers to next block. Both pointers have
-    @ moved by HT_bytes from their starts; next block starts T_bytes
-    @ further along, so advance by HT_bytes more (= T_bytes - HT_bytes).
-    lsr     r0, r9, #1                 @ r0 = HT_bytes
-    add     r11, r11, r0
-    add     r12, r12, r0
-
-    @ u_remaining--; loop if non-zero
+    @ u_remaining--
     ldr     r0, [sp, #0]
     subs    r0, r0, #1
     str     r0, [sp, #0]
-    bne     ntt_uloop
+    bne     ntt_uloop_scalar
 
-    @ Next layer: T_bytes /= 2; m *= 2
+ntt_layer_done:
+    @ HT_bytes /= 2; m *= 2
     lsr     r9, r9, #1
-    lsl     r10, r10, #1
+    ldr     r0, [sp, #8]
+    lsl     r0, r0, #1
+    str     r0, [sp, #8]
     b       ntt_layer
 
 ntt_done:
-    add     sp, sp, #8
+    add     sp, sp, #16
     pop     {r4-r11, lr}
     bx      lr
     .size   mq18433_NTT_plant, .-mq18433_NTT_plant
@@ -258,107 +346,201 @@ ntt_done:
     .type   mq18433_iNTT_plant, %function
     .thumb_func
     .align  2
+@ -------------------------------------------------------------------
+@ void mq18433_iNTT_plant(unsigned logn, uint16_t *a);
+@
+@ Gentleman-Sande inverse NTT.
+@   - Layer 0 (t=1): scalar path; one butterfly per block, k2-k1 = 2 bytes.
+@   - Layers 1..logn-1 (t>=2): packed path; r9 = 2*t bytes is k2-k1 stride.
+@
+@ Register map (callee-saved r4-r11 + lr; sub sp #16 for spills):
+@   r0,r1   x1,x2 packed (inner)
+@   r2      s = *p_iGM (per u-iter)
+@   r3,r8,r12  inner scratch
+@   r4      Q0I
+@   r5      Q
+@   r6      QA
+@   r7      Q_packed
+@   r9      t_bytes_doubled = 2*t (k2-k1 distance in bytes); doubles each layer
+@   r10     Qp1_packed
+@   r11     p_k1
+@   r14     v_remaining
+@   [sp+0]  u_remaining (= hm at layer start, decrements)
+@   [sp+4]  a_base
+@   [sp+8]  hm_current (per-layer)
+@   [sp+12] p_iGM (spilled to free r8 as inner scratch)
+@ -------------------------------------------------------------------
 mq18433_iNTT_plant:
     push    {r4-r11, lr}
-    sub     sp, sp, #8                 @ [sp+0] = u_remaining; [sp+4] = iGM_base
+    sub     sp, sp, #16
 
-    @ Load constants
-    movw    r4, #0x47FF
-    movt    r4, #0xEBC0                @ r4 = Q0I
-    movw    r5, #18433                 @ r5 = Q
-    mov.w   r6, #0x10000               @ r6 = QA
-
-    mov     r7, r1                     @ r7 = a_base
-
-    @ hm = 1 << (logn - 1)  (consume r0 before clobbering it for iGM_base)
-    @ Special case logn = 0: hm should be 0 (no layers). Handle by
-    @ checking r0 first. CBZ has narrow branch range and intti_done
-    @ is far away, so use cmp+beq.w instead.
+    @ logn = 0: nothing to do.
     cmp     r0, #0
     beq.w   intti_done
+
+    @ Scalar constants
+    movw    r4, #0x47FF
+    movt    r4, #0xEBC0                @ Q0I
+    movw    r5, #18433                 @ Q
+    mov.w   r6, #0x10000               @ QA
+
+    @ Packed constants
+    pkhbt   r7, r5, r5, lsl #16        @ Q_packed
+    adds    r3, r5, #1
+    pkhbt   r10, r3, r3, lsl #16       @ Qp1_packed
+
+    @ a_base on stack
+    str     r1, [sp, #4]
+
+    @ hm = 1 << (logn - 1)
     subs    r0, r0, #1
-    movs    r10, #1
-    lsl     r10, r10, r0               @ r10 = hm = 1 << (logn - 1)
+    movs    r3, #1
+    lsl     r3, r3, r0                 @ r3 = hm
+    str     r3, [sp, #8]               @ stash hm
 
-    @ Stash iGM_base on stack so we can re-derive p_iGM each layer.
-    movw    r0, #:lower16:mq18433_iGM
-    movt    r0, #:upper16:mq18433_iGM
-    str     r0, [sp, #4]
-
-    @ t_bytes = 2 (one halfword), doubles each layer
+    @ t_bytes_doubled = 2 (= 2 * 1 halfword initial t)
     movs    r9, #2
 
 intti_layer:
-    @ Stop when hm == 0 (CBZ only allows r0-r7; use cmp+beq)
-    cmp     r10, #0
-    beq     intti_done
+    ldr     r3, [sp, #8]               @ r3 = hm
+    cmp     r3, #0
+    beq.w   intti_done
 
-    @ p_iGM = iGM_base + hm*2
-    ldr     r3, [sp, #4]
-    add     r8, r3, r10, lsl #1
+    @ p_iGM = &iGM[hm] = iGM_base + hm*2
+    movw    r0, #:lower16:mq18433_iGM
+    movt    r0, #:upper16:mq18433_iGM
+    add     r0, r0, r3, lsl #1
+    str     r0, [sp, #12]              @ stash p_iGM
 
-    @ p_k1 = a_base; p_k2 = p_k1 + t_bytes
-    mov     r11, r7
-    add     r12, r11, r9
+    @ p_k1 = a_base; u_remaining = hm
+    ldr     r11, [sp, #4]
+    str     r3, [sp, #0]
 
-    @ u_remaining = hm
-    str     r10, [sp, #0]
+    @ Pick path: t_bytes_doubled >= 4 ⇒ packed (t>=2); == 2 ⇒ scalar (t=1)
+    cmp     r9, #4
+    blt     intti_uloop_scalar
 
-intti_uloop:
-    ldrh    r2, [r8], #2               @ r2 = s = *p_iGM++
-    @ v_remaining = t_halfwords = t_bytes / 2
-    lsr     r14, r9, #1
+@ ---------- PACKED u-loop (t >= 2) ----------
+intti_uloop_packed:
+    ldr     r8, [sp, #12]
+    ldrh    r2, [r8], #2               @ s = *p_iGM++
+    str     r8, [sp, #12]
 
-intti_vloop:
-    ldrh    r0, [r11]                  @ r0 = x1
-    ldrh    r1, [r12]                  @ r1 = x2
+    @ v_remaining (packed) = t/2 = r9/4
+    lsr     r14, r9, #2
 
-    @ d = canonical sub(x1, x2): r3 = x1 - x2; if <= 0, +Q
+intti_vloop_packed:
+    ldr.w   r0, [r11]                  @ x1 packed
+    ldr.w   r1, [r11, r9]              @ x2 packed
+
+    @ Canon-sub: r3 = canonical(x1 - x2) packed in [1..Q]
+    usub16  r3, r1, r0
+    uadd16  r8, r3, r7
+    sel     r3, r8, r3
+    ssub16  r3, r7, r3                 @ r3 = canon-sub result
+
+    @ Apply Plantard kernel to (s * canon-sub) per half → a[k2]
+    uxth    r8, r3
+    lsr     r12, r3, #16
+    mul     r8, r8, r2                 @ c_lo = s * sub_lo
+    mul     r12, r12, r2               @ c_hi
+    mul     r8, r8, r4                 @ c_lo * Q0I
+    mul     r12, r12, r4
+    lsr     r8, r8, #16                @ h_lo
+    lsr     r12, r12, #16
+    mla     r8, r8, r5, r6             @ h_lo*Q + QA
+    mla     r12, r12, r5, r6
+    lsr     r8, r8, #16                @ reduced_lo
+    lsr     r12, r12, #16
+    pkhbt   r3, r8, r12, lsl #16       @ packed reduced
+    str.w   r3, [r11, r9]              @ a[k2..k2+1] = montymul(s, canon-sub)
+
+    @ Canon-add: r3 = canonical(x1 + x2) packed in [1..Q]
+    uadd16  r3, r0, r1
+    usub16  r8, r3, r7
+    usub16  r12, r3, r10
+    sel     r3, r8, r3                 @ r3 = canon-add result
+
+    @ Apply half() per half: r3 = (sum + Q*lsb) >> 1.
+    @ Build r_oneone = 0x00010001 from r6 (QA = 0x10000): r8 = r6 + 1.
+    @ Then lsb-mask = r3 & 0x00010001 (packed); correction = lsb * Q (packed
+    @ — works because lsb_lo and lsb_hi are at bits 0 and 16 respectively).
+    @ After correction, both halves are even ⇒ lsr.w #1 safely halves both.
+    add     r8, r6, #1                 @ r8 = 0x00010001
+    and     r12, r3, r8                @ r12 = packed lsb mask
+    mul     r12, r12, r5               @ r12 = (0 or Q) per half
+    uadd16  r3, r3, r12                @ r3 = sum + Q*lsb (both halves even)
+    lsr     r3, r3, #1                 @ r3 = half(sum) packed
+    str.w   r3, [r11]                  @ a[k1..k1+1] = half(canon-add)
+
+    adds    r11, r11, #4
+    subs    r14, r14, #1
+    bne     intti_vloop_packed
+
+    @ End of v-loop: r11 advanced by r9/2 bytes from block start (t/2
+    @ packed iters × 4 bytes = 2*t bytes = r9). For iNTT, block size
+    @ is 2*t halfwords = 2*r9 bytes, so r11 needs to advance by r9 more
+    @ to reach next block start.
+    add     r11, r11, r9
+
+    ldr     r0, [sp, #0]
+    subs    r0, r0, #1
+    str     r0, [sp, #0]
+    bne     intti_uloop_packed
+    b       intti_layer_done
+
+@ ---------- SCALAR u-loop (t == 1, layer 0) ----------
+intti_uloop_scalar:
+    ldr     r8, [sp, #12]
+    ldrh    r2, [r8], #2
+    str     r8, [sp, #12]
+
+    ldrh    r0, [r11]                  @ x1
+    ldrh    r1, [r11, #2]              @ x2 (k2 = k1+1 halfword)
+
+    @ Canon-sub: r3 = canonical(x1 - x2)
     subs    r3, r0, r1
     it      le
     addle   r3, r3, r5
 
-    @ a[k2] = montymul(s, d): apply kernel to (r2 * r3)
+    @ montymul(s, canon-sub) → a[k2]
     mul     r3, r3, r2
     mul     r3, r3, r4
     lsr     r3, r3, #16
     mla     r3, r3, r5, r6
     lsr     r3, r3, #16
-    strh    r3, [r12], #2
 
-    @ s' = canonical add(x1, x2): r3 = x1 + x2; if > Q, -Q
-    add     r3, r0, r1
-    cmp     r3, r5
+    @ Canon-add: r0 = canonical(x1 + x2). x1 unused now; reuse r0.
+    add     r0, r0, r1
+    cmp     r0, r5
     it      hi
-    subhi   r3, r3, r5
+    subhi   r0, r0, r5
 
-    @ a[k1] = half(s'): r3 = (r3 + Q*(r3&1)) >> 1
-    and     r0, r3, #1                 @ r0 = lsb (x1 dead at this point)
-    mul     r0, r0, r5                 @ r0 = 0 or Q
-    add     r3, r3, r0
-    lsr     r3, r3, #1
-    strh    r3, [r11], #2
+    @ Half: r0 = (sum + Q*lsb) >> 1.
+    and     r12, r0, #1
+    mul     r12, r12, r5
+    add     r0, r0, r12
+    lsr     r0, r0, #1
 
-    subs    r14, r14, #1
-    bne     intti_vloop
+    strh    r0, [r11], #2              @ a[k1] = half(canon-add)
+    strh    r3, [r11], #2              @ a[k2] = montymul(s, canon-sub)
 
-    @ Advance pointers to next block: each += t_bytes
-    add     r11, r11, r9
-    add     r12, r12, r9
-
-    @ u_remaining--; loop if non-zero
+    @ For t=1, one butterfly per block. r11 now at next block's k1.
     ldr     r0, [sp, #0]
     subs    r0, r0, #1
     str     r0, [sp, #0]
-    bne     intti_uloop
+    bne     intti_uloop_scalar
 
-    @ Next layer: t_bytes *= 2; hm /= 2
+intti_layer_done:
+    @ t_bytes_doubled *= 2; hm /= 2
     lsl     r9, r9, #1
-    lsr     r10, r10, #1
+    ldr     r0, [sp, #8]
+    lsr     r0, r0, #1
+    str     r0, [sp, #8]
     b       intti_layer
 
 intti_done:
-    add     sp, sp, #8
+    add     sp, sp, #16
     pop     {r4-r11, lr}
     bx      lr
     .size   mq18433_iNTT_plant, .-mq18433_iNTT_plant
