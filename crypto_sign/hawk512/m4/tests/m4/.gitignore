@@ -1,0 +1,4 @@
+# Build-generated copy of common/keccakf1600.S, patched at build time
+# with the missing `.type X, %function` / `.thumb_func` directives so it
+# can be linked from C call sites. Source of truth is common/keccakf1600.S.
+keccakf1600_typed.S

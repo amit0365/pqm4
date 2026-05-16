@@ -147,9 +147,54 @@ Cortex-M4 ELF for QEMU `mps2-an386` board with semihosting. Run via:
 make -C crypto_sign/hawk512/m4/tests/m4 run        # montymul test
 make -C crypto_sign/hawk512/m4/tests/m4 run-ntt    # NTT + iNTT test
 make -C crypto_sign/hawk512/m4/tests/m4 run-bench  # asm vs C-ref benchmark
+make -C crypto_sign/hawk512/m4/tests/m4 run-smoke  # full HAWK keygen/sign/verify
 ```
 Requires `arm-none-eabi-gcc` and `qemu-system-arm` (both available via
 homebrew on macOS).
+
+**End-to-end smoke test (`run-smoke`)** builds the entire HAWK pipeline
+(hawk_kgen, hawk_sign, hawk_vrfy, ng_*, sha3) compiled with
+`HAWK_PLANT_NTT=1` so the asm NTT is exercised through actual
+sign/verify. Currently reports:
+```
+smoke_hawk: HAWK-512 keygen+sign+verify with asm NTT
+  keygen: OK
+  sign:   OK
+  verify: OK
+  tamper: rejected (OK)
+ALL TESTS PASSED — HAWK-512 sign/verify works under asm NTT
+```
+This empirically confirms what the per-primitive cross-check logically
+implied: with `mq18433_{NTT,iNTT,montymul}_plant` byte-identical to the
+reference, the full HAWK pipeline produces correct (verifiable, tamper-
+detecting) signatures.
+
+**FPU note**: HAWK is integer-only — the `fxr` type in `ng_inner.h` is
+fixed-point arithmetic emulated via integers, with zero real
+`double`/`float` types anywhere in the source. The build here **drops
+all FPU flags** (no `-mfpu`, no `-mfloat-abi=hard`), letting
+arm-none-eabi-gcc default to soft-float. Consequences:
+  - libgcc emits only integer instructions; no FPU enable required.
+  - No HardFault risk from libgcc helpers (e.g., `__aeabi_uldivmod`
+    for HAWK's 64-bit ops) hitting an unenabled FPU.
+  - Code size and cycle counts reflect pure integer M4 work — honest
+    for HAWK's actual computation profile.
+
+**DEVIATION FROM §3.3 SPEC**: the spec calls for `-mfpu=fpv4-sp-d16
+-mfloat-abi=hard` because pqm4's platform convention assumes
+hard-float (Falcon's NTT uses doubles; other schemes likewise). HAWK
+doesn't need it. If linking HAWK objects into a pqm4 binary that
+includes Falcon, you'd want to switch back to hard-float ABI for
+compatibility; for standalone HAWK on M4, soft-float is correct.
+
+**Keccak**: the smoke test uses pqm4's optimized `common/keccakf1600.S`.
+That file is missing `.type ..., %function` / `.thumb_func` directives
+at its entry points, so linking it from C call sites produces an
+"Unknown destination type (ARM/Thumb)" error. The Makefile awk-patches
+a local copy (`keccakf1600_typed.S`) at build time with the missing
+directives plus a CRLF strip (pqm4's file has Windows line endings).
+The patch is a one-line-per-entry addition that's worth upstreaming
+to pqm4 separately.
 
 **Benchmark results (QEMU instruction-count proxy — NOT M4 cycles)**:
 

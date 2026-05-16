@@ -52,6 +52,7 @@ __vectors:
     .thumb_func
 Reset_Handler:
     @ Copy .data from flash to RAM.
+    @ (No FPU enable: build uses soft-float, no FPU instructions emitted.)
     ldr     r0, =_sidata
     ldr     r1, =_sdata
     ldr     r2, =_edata
