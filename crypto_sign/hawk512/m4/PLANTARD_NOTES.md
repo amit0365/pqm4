@@ -255,46 +255,130 @@ Two concrete experiments to disambiguate:
      on cell read/write and would isolate whether the bug is
      in the cast or in the math.
 
+### Experiment (a) result — answered by reading ml-dsa's code
+
+ml-dsa's Plantard NTT does **not** claim mid-NTT byte equality
+with the reference. The architecture in
+`crypto_sign/ml-dsa-44/m4f/smallpoly.c`:
+
+```c
+small_ntt(out->coeffs);                   // canonical -> Plantard rep
+small_point_mul(out2, out->coeffs);       // Plantard-aware pointwise
+...
+small_asymmetric_mul(tmp, b, a, aprime);  // Plantard-aware composed mul
+small_invntt_tomont(tmp->coeffs);         // Plantard rep -> Mont canonical
+```
+
+There is no `reduce`/`caddq` step between `small_ntt` and the
+pointwise helpers (in contrast, the regular ml-dsa NTT — used
+for keygen — DOES call `polyveck_reduce` / `polyveck_caddq` after
+`invntt`, see `sign.c:51, 58, 145, 149`). The Plantard pipeline
+is **byte-equivalent at the pipeline boundary**, not at
+per-NTT boundaries.
+
+### Experiment (a) result — what the asm actually does
+
+The butterfly macros (`macros_smallntt.i:76-84`) use
+**`uadd16` / `usub16`** — unsigned packed 16-bit arithmetic
+that wraps mod 2¹⁶ per half. So the running representation
+is "uint16 modulo 2¹⁶, congruent to the true value mod Q",
+**not** centred signed int16. Coefficients can drift in
+`[0, 2¹⁶)` between layers; the invariant kept across layers
+is modular equivalence mod Q, not a centred range.
+
+### Why my Path A attempt failed (root cause)
+
+My C attempt cast cells to `int16_t` (sign-extending any cell
+with bit 15 set) and then used signed int32 arithmetic. That
+introduced a **representation mismatch** with what the asm
+would actually do (uint16 wrap arithmetic). The single-
+coefficient `plant_red` was correct, the n=4 NTT happened to
+work because no cell had bit 15 set, and divergence started at
+n≥256 when post-butterfly values landed in cells with bit 15
+set and subsequent reads sign-extended them into different
+modular residues than the uint16 wrap would have.
+
+The right C reference for Path A is:
+  - Cells as `uint16_t a[N]` throughout (no int16 cast on read).
+  - Add/sub as `(uint16_t)(a + b)` / `(uint16_t)(a - b)` — wraps
+    mod 2¹⁶ per the same semantics as `uadd16`/`usub16`.
+  - `plant_red` returns a value to be **packed back into uint16**
+    via the same wrap (matching `pkhtb \a, \a, \tmp, asr#16` in
+    the asm).
+  - No "centred_reduce" inside the loop — drift is allowed.
+  - A **final** reduction pass at iNTT exit (analog of
+    `small_invntt_tomont`) converts back to canonical `[1..Q]`.
+  - Plantard-aware pointwise helpers — composed
+    `mq18433_basemul_plant(w1, w2)` (combines `montymul`-equivalent
+    for the pointwise loop), `mq18433_sub_plant`,
+    `mq18433_tomonty_plant` — mirroring `small_point_mul` /
+    `small_asymmetric_mul` from ml-dsa.
+
+This rewrites my attempt cleanly. The test changes from
+"per-NTT byte equality" to "**after full pipeline** byte
+equality" (e.g., compare `mq18433_NTT(w);  pointwise;
+mq18433_iNTT(w)` against `mq18433_NTT_plant(w);  pointwise_plant;
+mq18433_iNTT_plant(w)`, byte-equal at the end).
+
 ## Plan (next iteration)
 
-1. ~~**Lock the encoding.**~~ ✅ — use `Q0I = 3955247103` with
-   identity twiddle encoding; the existing `GM[]` / `iGM[]` tables
-   are reusable as-is.
-2. ~~**Drop in NTT/iNTT replacements behind `HAWK_PLANT_NTT=1`**~~ ✅
-   `plant_18433.{c,h}` provide externally-linkable
-   `mq18433_NTT_plant` / `mq18433_iNTT_plant` /
-   `mq18433_montymul_plant`. With `HAWK_PLANT_NTT=1` set,
-   `hawk_sign.c` re-routes all 15 call sites of `mq18433_*` to these
-   symbols via macro redefinition. With the flag unset, the upstream
-   static inlines are used (default behaviour).
-3. ~~**Extend the cross-check test** to compare a full
-   `mq18433_NTT(a) / mq18433_iNTT(a)` byte-for-byte against the
-   Plantard versions over many random polynomials.~~ ✅
-   `tests/test_plant_ntt.c` checks fwd NTT, inv NTT, and the
-   fwd+inv roundtrip across `logn ∈ {8, 9, 10}` with many random
-   polynomials each. Currently all `ALL TESTS PASSED` (the C
-   plant version IS the reference internally — by construction
-   byte-identical — so this is the ground truth the asm port has
-   to match).
-4. **Implement `plant_18433_cm4.S`** (M4 asm) using the
-   three-instruction `mul / lsr / smlatb+rounding` reducer locked
-   down above, packed-pair form via
-   `smulwb / smulwt / smlatb / smlatb` for two coefficients per
-   butterfly. Layer-merge 2–3 layers per pass for register
-   residency.
-   **Status**: not yet written. Requires ARM toolchain + M4
-   hardware to verify assembly and run the cross-check at all (no
-   ARM cross-compiler in the current dev environment). When the
-   `.S` file lands, it provides the same `mq18433_*_plant` symbols
-   as `plant_18433.c`; the build picks one or the other based on
-   target. The cross-check test in step 3 catches any byte-drift
-   immediately.
-5. **Benchmark on NUCLEO-L4R5ZI** using pqm4's `speed_test`
-   harness, compare to the upstream-C baseline. Target:
-   sign-512 < 500 k cycles, verify-512 < 300 k cycles.
+Path A is the right direction (~25 % faster than Path B per the
+earlier analysis); experiment (a) above shows ml-dsa already
+proves it's viable. My in-tree C attempt failed for a specific
+reason now understood (`int16_t` cast instead of `uint16_t` wrap
+arithmetic). Concrete next steps:
 
-`hawk_sign.c` ships with `HAWK_PLANT_NTT` undefined by default, so
-the production path remains upstream `mq18433_*`. Defining the flag
-(`-DHAWK_PLANT_NTT=1` in `crypto_sign/hawk512/m4/config.mk` or via
-the make command line) flips it on once on-target measurements
-justify the switch.
+1. ~~Lock the kernel encoding (`Q0I = 3955247103`, qa = `1<<16`
+   for monty-byte-equality or qa = `Q` for ml-dsa-style Plantard).~~ ✅
+
+2. ~~Wire `HAWK_PLANT_NTT=1` macro layer into `hawk_sign.c`.~~ ✅
+
+3. ~~Cross-check infrastructure (`tests/test_plant_ntt.c`).~~ ✅
+
+4. **Rewrite `plant_18433.c` for uint16-wrap arithmetic** (per
+   experiment (a)). All cells are `uint16_t`; add/sub via
+   `(uint16_t)(a + b)` and `(uint16_t)(a - b)`. `plant_red`
+   returns a `uint16_t` to be stored directly (no signed cast).
+   The C reference no longer mirrors `Zq(NTT)` line-for-line —
+   it mirrors the **asm's** semantics (so it'll match the asm
+   byte-for-byte, but not the reference NTT byte-for-byte).
+
+5. **Write the Plantard-aware pointwise helpers**:
+   `mq18433_montymul_plant`, `mq18433_sub_plant`,
+   `mq18433_tomonty_plant`, plus the composed
+   `mq18433_compose_plant(w2, w3, w1)` that mirrors the
+   `tomonty(sub(montymul(w2, w3), w1))` chain in
+   `hawk_sign.c:1098-1101` — analog of ml-dsa's
+   `small_asymmetric_mul`.
+
+6. **Adjust the cross-check** to test **pipeline-level**
+   byte equality, not per-NTT:
+
+   ```c
+   /* Reference pipeline (canonical math throughout). */
+   mq18433_NTT(logn, w1); mq18433_NTT(logn, w2);
+   for (u..) w1[u] = mq18433_montymul(w1[u], w2[u]);
+   mq18433_iNTT(logn, w1);
+
+   /* Plant pipeline (Plantard math, canonical only at exit). */
+   mq18433_NTT_plant(logn, w1p); mq18433_NTT_plant(logn, w2p);
+   for (u..) w1p[u] = mq18433_montymul_plant(w1p[u], w2p[u]);
+   mq18433_iNTT_plant(logn, w1p);
+   /* No extra normalise — iNTT_plant ends in canonical form. */
+
+   memcmp(w1, w1p) == 0;  // byte equality at the boundary
+   ```
+
+   Same boundary as ml-dsa: enter canonical, leave canonical,
+   stay in Plantard form between.
+
+7. **Implement `plant_18433_cm4.S`** by adapting ml-dsa's
+   `smallntt_769.S`: substitute `q=18433`, `qa` per choice, the
+   Plantard-encoded twiddle table generated from HAWK's `GM[]`,
+   and add the extra layer-group for `n=512` / `n=1024`.
+
+8. **Benchmark on NUCLEO-L4R5ZI**.
+
+`hawk_sign.c` ships with `HAWK_PLANT_NTT` undefined by default,
+so the production path remains upstream `mq18433_*`. The flag
+flips it on once on-target measurements justify the switch.
