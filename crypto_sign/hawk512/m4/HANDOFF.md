@@ -151,7 +151,27 @@ make -C crypto_sign/hawk512/m4/tests/m4 run-bench  # asm vs C-ref benchmark
 Requires `arm-none-eabi-gcc` and `qemu-system-arm` (both available via
 homebrew on macOS).
 
-**Benchmark results (QEMU, SysTick proxy under -icount shift=0)**:
+**Benchmark results (QEMU instruction-count proxy — NOT M4 cycles)**:
+
+⚠️ The numbers below are *SysTick ticks under QEMU `-icount shift=0`*,
+which mechanically equals "emulated instructions executed / 40". This
+is an **instruction-count proxy**, not a cycle count. QEMU doesn't
+model the Cortex-M4 pipeline, dual-issue, flash wait states, prefetch,
+branch prediction, or load-use stalls. Real-silicon cycles will differ.
+
+**How to quote these in a paper:**
+- ✅ "We observed an asm-vs-C *speedup ratio* of ~22% on QEMU mps2-an386 under -icount shift=0 (instruction-count proxy)."
+- ✅ As directional / ordering evidence: "asm is faster than C reference".
+- ❌ Do NOT quote absolute counts as M4 cycles ("1484 cycles for HAWK-512 NTT").
+- ❌ Do NOT compare these absolute numbers to other papers' real-hardware numbers.
+
+To get paper-quotable cycle counts: build on NUCLEO-L4R5ZI (pqm4's
+reference board) and run `speed.elf` — DWT->CYCCNT works on real
+silicon and gives true cycle counts. The 22%/16% speedup ratio should
+hold to within ~5-10% on real hardware (instruction-count differences
+matter mostly via ldrh/strh latencies on flash, which are similar
+between the C and asm versions of this code).
+
 
 | op   | logn | C-ref | asm  | speedup |
 |------|------|-------|------|---------|
