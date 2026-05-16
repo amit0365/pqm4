@@ -39,8 +39,8 @@ SRC_DIR := ../..
 ASM_SRC := $(SRC_DIR)/plant_18433_cm4.S
 TBL_SRC := $(SRC_DIR)/plant_18433_cm4_tables.c
 
-.PHONY: all run run-ntt run-bench run-smoke clean disasm
-all: test_montymul.elf test_ntt.elf bench_ntt.elf smoke_hawk.elf
+.PHONY: all run run-ntt run-bench run-smoke run-profile clean disasm
+all: test_montymul.elf test_ntt.elf bench_ntt.elf smoke_hawk.elf profile_hawk.elf
 
 # HAWK end-to-end smoke test: compiles every HAWK source for M4 with
 # HAWK_PLANT_NTT=1 so the asm path is exercised through sign/verify.
@@ -140,6 +140,46 @@ run-bench: bench_ntt.elf
 
 run-smoke: smoke_hawk.elf
 	$(QEMU) -kernel smoke_hawk.elf
+
+run-profile: profile_hawk.elf
+	$(QEMU) $(ICOUNT) -kernel profile_hawk.elf
+
+profile_hawk.o: profile_hawk.c semihost.h
+	$(CC) $(SMOKE_CFLAGS) -c profile_hawk.c -o $@
+
+PROF_WRAPS = -Wl,--wrap=mq18433_NTT_plant \
+             -Wl,--wrap=mq18433_iNTT_plant \
+             -Wl,--wrap=mq18433_montymul_plant \
+             -Wl,--wrap=KeccakF1600_StatePermute \
+             -Wl,--wrap=KeccakF1600_StateXORBytes \
+             -Wl,--wrap=KeccakF1600_StateExtractBytes \
+             -Wl,--wrap=extract_lowbit \
+             -Wl,--wrap=basis_m2_mul \
+             -Wl,--wrap=sig_gauss \
+             -Wl,--wrap=sig_gauss_alt \
+             -Wl,--wrap=poly_symbreak \
+             -Wl,--wrap=encode_sig
+
+# Profile build needs hawk_sign.c + hawk_vrfy.c compiled with HAWK_PROFILE
+# so PROF_CALL/VPROF_CALL macros expand to cycle-counting wrappers.
+prof_hawk_sign.o: $(SRC_DIR)/hawk_sign.c
+	$(CC) $(SMOKE_CFLAGS) -DHAWK_PROFILE=1 -c $< -o $@
+prof_hawk_vrfy.o: $(SRC_DIR)/hawk_vrfy.c
+	$(CC) $(SMOKE_CFLAGS) -DHAWK_PROFILE=1 -c $< -o $@
+prof_ng_hawk.o: $(SRC_DIR)/ng_hawk.c
+	$(CC) $(SMOKE_CFLAGS) -DHAWK_PROFILE=1 -c $< -o $@
+
+PROF_HAWK_OBJS = prof_hawk_sign.o prof_hawk_vrfy.o prof_ng_hawk.o \
+                 smoke_hawk_kgen.o \
+                 smoke_ng_fxp.o smoke_ng_mp31.o \
+                 smoke_ng_ntru.o smoke_ng_poly.o smoke_ng_zint31.o \
+                 smoke_sha3.o
+
+profile_hawk.elf: startup.o profile_hawk.o libc_stubs.o $(PROF_HAWK_OBJS) \
+                  keccakf1600.o plant_asm.o plant_tables.o qemu.ld
+	$(CC) $(SMOKE_LDFLAGS) $(PROF_WRAPS) startup.o profile_hawk.o libc_stubs.o $(PROF_HAWK_OBJS) \
+	                       keccakf1600.o plant_asm.o plant_tables.o -lgcc -o $@
+	@$(SIZE) $@
 
 disasm: test_montymul.elf
 	$(OBJDUMP) -d $< | less

@@ -19,6 +19,40 @@
 #define mq18433_montymul  mq18433_montymul_plant
 #endif
 
+/* Profiling hooks (off by default). When HAWK_PROFILE is defined to
+ * non-zero, the call sites in sign_finish_inner are bracketed with
+ * cycle-counter snapshots that accumulate into externally-defined
+ * counters (see tests/m4/profile_hawk.c). No-ops otherwise. */
+#if defined(HAWK_PROFILE) && HAWK_PROFILE
+#include <stdint.h>
+typedef struct { uint32_t wraps; uint32_t cvr; } cyc_snap_t;
+extern cyc_snap_t cyc_snap_ext(void);
+extern uint64_t   cyc_elapsed_ext(cyc_snap_t t0, cyc_snap_t t1);
+extern uint64_t prof_extract_lowbit_cyc; extern uint32_t prof_extract_lowbit_calls;
+extern uint64_t prof_basis_m2_mul_cyc;   extern uint32_t prof_basis_m2_mul_calls;
+extern uint64_t prof_sig_gauss_cyc;      extern uint32_t prof_sig_gauss_calls;
+extern uint64_t prof_sig_gauss_alt_cyc;  extern uint32_t prof_sig_gauss_alt_calls;
+extern uint64_t prof_poly_symbreak_cyc;  extern uint32_t prof_poly_symbreak_calls;
+extern uint64_t prof_encode_sig_cyc;     extern uint32_t prof_encode_sig_calls;
+#  define PROF_CALL(name, call) do { \
+      cyc_snap_t _p_t0 = cyc_snap_ext(); \
+      call; \
+      cyc_snap_t _p_t1 = cyc_snap_ext(); \
+      prof_##name##_cyc += cyc_elapsed_ext(_p_t0, _p_t1); \
+      prof_##name##_calls += 1; \
+   } while (0)
+#  define PROF_CALL_ASSIGN(name, var, call) do { \
+      cyc_snap_t _p_t0 = cyc_snap_ext(); \
+      (var) = (call); \
+      cyc_snap_t _p_t1 = cyc_snap_ext(); \
+      prof_##name##_cyc += cyc_elapsed_ext(_p_t0, _p_t1); \
+      prof_##name##_calls += 1; \
+   } while (0)
+#else
+#  define PROF_CALL(name, call) call
+#  define PROF_CALL_ASSIGN(name, var, call) (var) = (call)
+#endif
+
 /*
  * Binary polynomials (GF(2)[X]); inputs a and b have size N bits;
  * output d has size N or 2*N bits, depending on the operation:
@@ -987,9 +1021,10 @@ sign_finish_inner(unsigned logn, int use_shake,
 		/*
 		 * t <- B*h  (mod 2)
 		 */
-		extract_lowbit(logn, f2, f);
-		extract_lowbit(logn, g2, g);
-		basis_m2_mul(logn, t0, t1, h0, h1, f2, g2, F2, G2, xx);
+		PROF_CALL(extract_lowbit, extract_lowbit(logn, f2, f));
+		PROF_CALL(extract_lowbit, extract_lowbit(logn, g2, g));
+		PROF_CALL(basis_m2_mul,
+			basis_m2_mul(logn, t0, t1, h0, h1, f2, g2, F2, G2, xx));
 
 #if HAWK_DEBUG
 		printf("# t = B*h (mod 2)\n");
@@ -1019,9 +1054,11 @@ sign_finish_inner(unsigned logn, int use_shake,
 				shake_inject(&scd, priv, seed_len);
 			}
 			shake_inject(&scd, tbuf, sizeof tbuf);
-			xsn = sig_gauss(logn, rng, rng_context, &scd, x0, t0);
+			PROF_CALL_ASSIGN(sig_gauss, xsn,
+				sig_gauss(logn, rng, rng_context, &scd, x0, t0));
 		} else {
-			xsn = sig_gauss_alt(logn, rng, rng_context, x0, t0);
+			PROF_CALL_ASSIGN(sig_gauss_alt, xsn,
+				sig_gauss_alt(logn, rng, rng_context, x0, t0));
 		}
 #if HAWK_DEBUG
 		printf("# (dx0, dx1) = (2*x0, 2*x1)\n");
@@ -1117,7 +1154,8 @@ sign_finish_inner(unsigned logn, int use_shake,
 		 * We also enforce a limit on the individual elements of s1.
 		 */
 		int16_t *s1 = (int16_t *)w3;
-		uint32_t ps = poly_symbreak(logn, s1);
+		uint32_t ps;
+		PROF_CALL_ASSIGN(poly_symbreak, ps, poly_symbreak(logn, s1));
 #if HAWK_DEBUG
 		printf("symbreak = %d\n", (int)ps);
 #endif
@@ -1153,7 +1191,10 @@ sign_finish_inner(unsigned logn, int use_shake,
 		 * output buffer.
 		 */
 		size_t sig_len = HAWK_SIG_SIZE(logn);
-		if (encode_sig(logn, tmp, sig_len, salt, salt_len, s1)) {
+		int _enc_ok;
+		PROF_CALL_ASSIGN(encode_sig, _enc_ok,
+			encode_sig(logn, tmp, sig_len, salt, salt_len, s1));
+		if (_enc_ok) {
 #if HAWK_DEBUG
 			print_blob("sig", tmp, sig_len);
 #endif

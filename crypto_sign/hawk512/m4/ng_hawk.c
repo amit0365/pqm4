@@ -1,5 +1,34 @@
 #include "ng_inner.h"
 
+/* Profiling hooks (off by default). See hawk_sign.c. */
+#if defined(HAWK_PROFILE) && HAWK_PROFILE
+#include <stdint.h>
+typedef struct { uint32_t wraps; uint32_t cvr; } cyc_snap_t;
+extern cyc_snap_t cyc_snap_ext(void);
+extern uint64_t   cyc_elapsed_ext(cyc_snap_t t0, cyc_snap_t t1);
+extern uint64_t prof_solve_NTRU_cyc;   extern uint32_t prof_solve_NTRU_calls;
+extern uint64_t prof_vect_FFT_cyc;     extern uint32_t prof_vect_FFT_calls;
+extern uint64_t prof_vect_iFFT_cyc;    extern uint32_t prof_vect_iFFT_calls;
+extern uint64_t prof_recover_G_cyc;    extern uint32_t prof_recover_G_calls;
+#  define KPROF_CALL(name, call) do { \
+      cyc_snap_t _p_t0 = cyc_snap_ext(); \
+      call; \
+      cyc_snap_t _p_t1 = cyc_snap_ext(); \
+      prof_##name##_cyc += cyc_elapsed_ext(_p_t0, _p_t1); \
+      prof_##name##_calls += 1; \
+   } while (0)
+#  define KPROF_CALL_ASSIGN(name, var, call) do { \
+      cyc_snap_t _p_t0 = cyc_snap_ext(); \
+      (var) = (call); \
+      cyc_snap_t _p_t1 = cyc_snap_ext(); \
+      prof_##name##_cyc += cyc_elapsed_ext(_p_t0, _p_t1); \
+      prof_##name##_calls += 1; \
+   } while (0)
+#else
+#  define KPROF_CALL(name, call) call
+#  define KPROF_CALL_ASSIGN(name, var, call) (var) = (call)
+#endif
+
 static const ntru_profile SOLVE_Hawk_256 = {
 	1,
 	8, 8,
@@ -583,7 +612,7 @@ Hawk_keygen(unsigned logn,
 		for (size_t u = 0; u < n; u ++) {
 			rt1[u] = fxr_of(*(int32_t *)&t1[u]);
 		}
-		vect_FFT(logn, rt1);
+		KPROF_CALL(vect_FFT, vect_FFT(logn, rt1));
 		for (size_t u = 0; u < hn; u ++) {
 			rt1[u] = fxr_inv(rt1[u]);
 		}
@@ -592,7 +621,7 @@ Hawk_keygen(unsigned logn,
 		for (size_t u = hn; u < n; u ++) {
 			rt1[u] = fxr_zero;
 		}
-		vect_iFFT(logn, rt1);
+		KPROF_CALL(vect_iFFT, vect_iFFT(logn, rt1));
 
 		if (fxr_lt(d0high, rt1[0])) {
 #if NTRUGEN_STATS
@@ -607,7 +636,8 @@ Hawk_keygen(unsigned logn,
 #if NTRUGEN_STATS
 		stats_solve_attempt ++;
 #endif
-		int err = solve_NTRU(prof, logn, f, g, tt32);
+		int err;
+		KPROF_CALL_ASSIGN(solve_NTRU, err, solve_NTRU(prof, logn, f, g, tt32));
 		switch (err) {
 		case SOLVE_OK:
 #if NTRUGEN_STATS

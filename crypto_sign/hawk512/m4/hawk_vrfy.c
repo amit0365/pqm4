@@ -1,5 +1,37 @@
 #include "hawk_inner.h"
 
+/* Profiling hooks (off by default). See hawk_sign.c for explanation. */
+#if defined(HAWK_PROFILE) && HAWK_PROFILE
+#include <stdint.h>
+typedef struct { uint32_t wraps; uint32_t cvr; } cyc_snap_t;
+extern cyc_snap_t cyc_snap_ext(void);
+extern uint64_t   cyc_elapsed_ext(cyc_snap_t t0, cyc_snap_t t1);
+extern uint64_t prof_mp_NTT_cyc;          extern uint32_t prof_mp_NTT_calls;
+extern uint64_t prof_mp_NTT_autoadj_cyc;  extern uint32_t prof_mp_NTT_autoadj_calls;
+extern uint64_t prof_fx32_FFT_cyc;        extern uint32_t prof_fx32_FFT_calls;
+extern uint64_t prof_fx32_iFFT_cyc;       extern uint32_t prof_fx32_iFFT_calls;
+extern uint64_t prof_decode_q00_cyc;      extern uint32_t prof_decode_q00_calls;
+extern uint64_t prof_decode_q01_cyc;      extern uint32_t prof_decode_q01_calls;
+extern uint64_t prof_decode_s1_cyc;       extern uint32_t prof_decode_s1_calls;
+#  define VPROF_CALL(name, call) do { \
+      cyc_snap_t _p_t0 = cyc_snap_ext(); \
+      call; \
+      cyc_snap_t _p_t1 = cyc_snap_ext(); \
+      prof_##name##_cyc += cyc_elapsed_ext(_p_t0, _p_t1); \
+      prof_##name##_calls += 1; \
+   } while (0)
+#  define VPROF_CALL_ASSIGN(name, var, call) do { \
+      cyc_snap_t _p_t0 = cyc_snap_ext(); \
+      (var) = (call); \
+      cyc_snap_t _p_t1 = cyc_snap_ext(); \
+      prof_##name##_cyc += cyc_elapsed_ext(_p_t0, _p_t1); \
+      prof_##name##_calls += 1; \
+   } while (0)
+#else
+#  define VPROF_CALL(name, call) call
+#  define VPROF_CALL_ASSIGN(name, var, call) (var) = (call)
+#endif
+
 /* ==================================================================== */
 /*
  * Modular integers.
@@ -629,7 +661,7 @@ mp_poly_to_NTT(unsigned logn, uint32_t *d, const int16_t *a,
 		uint32_t x = a[u];
 		d[u] = x + (p & tbmask(x));
 	}
-	mp_NTT(logn, d, gm, p, p0i);
+	VPROF_CALL(mp_NTT, mp_NTT(logn, d, gm, p, p0i));
 }
 
 /*
@@ -649,7 +681,7 @@ mp_poly_to_NTT_autoadj(unsigned logn, uint32_t *d, const int16_t *a,
 		uint32_t x = a[u];
 		d[u] = x + (p & tbmask(x));
 	}
-	mp_NTT_autoadj(logn, d, gm, p, p0i);
+	VPROF_CALL(mp_NTT_autoadj, mp_NTT_autoadj(logn, d, gm, p, p0i));
 }
 
 /* ==================================================================== */
@@ -1483,7 +1515,8 @@ decode_sig_inner(unsigned logn, uint8_t *salt, size_t salt_len, int16_t *s1,
 	}
 	buf += salt_len;
 	buf_len -= salt_len;
-	size_t s1_len = decode_s1(logn, s1, buf, buf_len);
+	size_t s1_len;
+	VPROF_CALL_ASSIGN(decode_s1, s1_len, decode_s1(logn, s1, buf, buf_len));
 	if (s1_len == 0) {
 		return 0;
 	}
@@ -1509,7 +1542,8 @@ Zh(decode_public_key)(unsigned logn, int16_t *q00_q01_hpk,
 	size_t buf_len = pub_len;
 
 	/* Decode q00 */
-	size_t len00 = decode_q00(logn, q00, buf, buf_len);
+	size_t len00;
+	VPROF_CALL_ASSIGN(decode_q00, len00, decode_q00(logn, q00, buf, buf_len));
 	if (len00 == 0) {
 		return 0;
 	}
@@ -1517,7 +1551,8 @@ Zh(decode_public_key)(unsigned logn, int16_t *q00_q01_hpk,
 	buf_len -= len00;
 
 	/* Decode q01 */
-	size_t len01 = decode_q01(logn, q01, buf, buf_len);
+	size_t len01;
+	VPROF_CALL_ASSIGN(decode_q01, len01, decode_q01(logn, q01, buf, buf_len));
 	if (len01 == 0) {
 		return 0;
 	}
@@ -1743,7 +1778,7 @@ Zh(verify_inner)(unsigned logn,
 		/* t1 is entirely 0, this is not valid */
 		return 0;
 	}
-	fx32_FFT(logn, ft1);
+	VPROF_CALL(fx32_FFT, fx32_FFT(logn, ft1));
 
 #if HAWK_DEBUG
 	printf("# ft1 = FFT(h1 - 2*s1)\n");
@@ -1765,7 +1800,7 @@ Zh(verify_inner)(unsigned logn,
 			return 0;
 		}
 		q00buf = (uint8_t *)pub;
-		q00buf_len = decode_q00(logn, q00, q00buf, pub_len - 1);
+		VPROF_CALL_ASSIGN(decode_q00, q00buf_len, decode_q00(logn, q00, q00buf, pub_len - 1));
 		if (q00buf_len == 0) {
 			return 0;
 		}
@@ -1803,7 +1838,7 @@ Zh(verify_inner)(unsigned logn,
 		fq00[u] = z;
 		fq00[n - u] = -z;
 	}
-	fx32_FFT(logn, fq00);
+	VPROF_CALL(fx32_FFT, fx32_FFT(logn, fq00));
 
 #if HAWK_DEBUG
 	printf("# fq00 = FFT(q00') (q00' = q00 except that q00'[0] = 0)\n");
@@ -1824,7 +1859,8 @@ Zh(verify_inner)(unsigned logn,
 		q01 = (int16_t *)(fq01 + hn);
 		q01buf = q00buf + q00buf_len;
 		q01buf_len = pub_len - q00buf_len;
-		size_t len01 = decode_q01(logn, q01, q01buf, q01buf_len);
+		size_t len01;
+		VPROF_CALL_ASSIGN(decode_q01, len01, decode_q01(logn, q01, q01buf, q01buf_len));
 		if (len01 == 0) {
 			return 0;
 		}
@@ -1841,7 +1877,7 @@ Zh(verify_inner)(unsigned logn,
 	for (size_t u = 0; u < n; u ++) {
 		fq01[u] = fx32_of(q01[u], sh_q01);
 	}
-	fx32_FFT(logn, fq01);
+	VPROF_CALL(fx32_FFT, fx32_FFT(logn, fq01));
 
 #if HAWK_DEBUG
 	printf("# fq01 = FFT(q01)\n");
@@ -1930,7 +1966,7 @@ Zh(verify_inner)(unsigned logn,
 
 #undef M
 	}
-	fx32_iFFT(logn, fq01);
+	VPROF_CALL(fx32_iFFT, fx32_iFFT(logn, fq01));
 
 #if HAWK_DEBUG
 	printf("# fz = (q01*t1)/q00\n");
