@@ -156,16 +156,28 @@ homebrew on macOS).
 | op   | logn | C-ref | asm  | speedup |
 |------|------|-------|------|---------|
 | NTT  | 6    | 133   | 102  | 23%     |
-| iNTT | 6    | 145   | 120  | 17%     |
-| NTT  | 9 (HAWK-512)  | 1483  | 1154 | 22%     |
-| iNTT | 9 (HAWK-512)  | 1643  | 1372 | 16%     |
-| NTT  | 10 (HAWK-1024) | 3257  | 2536 | 22%     |
-| iNTT | 10 (HAWK-1024) | 3615  | 3023 | 16%     |
+| iNTT | 6    | 146   | 120  | 17%     |
+| NTT  | 9 (HAWK-512)  | 1484  | 1154 | 22%     |
+| iNTT | 9 (HAWK-512)  | 1644  | 1372 | 16%     |
+| NTT  | 10 (HAWK-1024) | 3257  | 2537 | 22%     |
+| iNTT | 10 (HAWK-1024) | 3615  | 3024 | 16%     |
 
-Numbers are SysTick ticks under `-icount shift=0` — roughly 40 emulated
-instructions per tick on mps2-an386. NOT pipeline-accurate (QEMU doesn't
-model M4 dual-issue, flash waits, or prefetch). The RATIOS should
-track real-silicon RATIOS reasonably well; absolute numbers won't.
+**Methodology deviations from the paper §3.3 spec** — the harness here
+matches §3.3 *partially*:
+
+| §3.3 spec requirement                          | This harness                                            | Reconcile when... |
+|-----------------------------------------------|---------------------------------------------------------|-------------------|
+| ARM GNU Toolchain 15.2                         | 16.1.0 from homebrew                                    | upgrade to xpack/ARM official tarball |
+| Cortex-M4 + Thumb-2 + FPv4-SP-D16 + hard float | ✅ same (`-mcpu=cortex-m4 -mthumb -mfpu=fpv4-sp-d16 -mfloat-abi=hard`) | — |
+| Newlib-nano linked                             | `-ffreestanding -nostdlib` (homebrew toolchain has no newlib bundled) | toolchain bundle that includes newlib (e.g., xpack) |
+| `qemu-system-arm -M mps2-an386 -cpu cortex-m4` | ✅ same                                                  | — |
+| SysTick with IRQ-driven wrap counter           | ✅ implemented (handler in `startup.S` vector table at 0x3C; counter in `bench_ntt.c`) | — |
+| Deterministic M4 cycle counts                  | `-icount shift=0` — instruction-count proxy, NOT pipeline-accurate. QEMU's mps2-an386 doesn't model M4 dual-issue, flash waits, or prefetch | run on real silicon (NUCLEO-L4R5ZI) with `speed.elf` |
+
+**What this means for the numbers**: the *ratios* (22% / 16%) should
+track real silicon to within a few percent. *Absolute* counts (e.g.,
+"1484 ticks for NTT-9") are not real cycle counts and shouldn't be
+quoted as such. For paper-grade absolute numbers, run on hardware.
 
 **Caveat**: ~20% is the modest-scalar-asm ceiling. Compiler-generated
 C with inlined montymul/add/sub already runs ~21-25 instructions per

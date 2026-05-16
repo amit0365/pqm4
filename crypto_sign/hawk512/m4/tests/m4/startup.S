@@ -2,10 +2,15 @@
  * Minimal Cortex-M4 startup for the QEMU mps2-an386 board.
  *
  * Provides:
- *   - Vector table with initial SP and Reset_Handler entry
+ *   - Full 16-slot ARMv7-M system vector table (offsets 0..0x3C)
+ *     including SysTick_Handler at offset 0x3C (vector 15).
  *   - Reset_Handler: copies .data from flash to RAM, zeros .bss,
  *     calls main(), then halts via semihosting SYS_EXIT.
  *   - Default HardFault handler that BKPTs (visible to QEMU).
+ *   - SysTick_Handler: weak alias to a default that increments
+ *     `systick_wrap_count` (defined in bench code) so that a
+ *     long-running benchmark can recover a 56-bit virtual cycle
+ *     count: wrap_count << 24 + (SYST_RVR - SYST_CVR).
  */
 
     .syntax unified
@@ -30,7 +35,15 @@ __vectors:
     .word   HardFault_Handler       @ 0x10  MemManage
     .word   HardFault_Handler       @ 0x14  BusFault
     .word   HardFault_Handler       @ 0x18  UsageFault
-    @ rest of vector table not required for this harness
+    .word   0                       @ 0x1C  Reserved
+    .word   0                       @ 0x20  Reserved
+    .word   0                       @ 0x24  Reserved
+    .word   0                       @ 0x28  Reserved
+    .word   SVC_Handler             @ 0x2C  SVCall
+    .word   HardFault_Handler       @ 0x30  Debug Monitor
+    .word   0                       @ 0x34  Reserved
+    .word   PendSV_Handler          @ 0x38  PendSV
+    .word   SysTick_Handler         @ 0x3C  SysTick
 
     .text
 
@@ -60,22 +73,15 @@ Reset_Handler:
     @ Call main().
     bl      main
 
-    @ main() returned: r0 has exit code. Issue semihosting SYS_EXIT.
-    @ ARM semihosting v2 SYS_EXIT_EXTENDED (0x20): TARGET_SIG_APP_EXIT, code.
-    @ For ARMv7-M with v1 compat, SYS_EXIT (0x18) takes ADP_Stopped_ApplicationExit
-    @ (0x20026) as r1 to signal clean exit. We pass r0 (main's return) through.
-    @ Simplest: use semihosting SYS_EXIT with status from r0.
-    @ Spec for AArch32: r0=0x18, r1=0x20026 means ApplicationExit (clean).
-    @ Non-zero exit on failure: r0=0x18, r1=non-zero-code (legacy form).
+    @ main() returned: r0 = exit code. Semihosting SYS_EXIT.
     cbz     r0, exit_ok
-    @ Failure exit: code in r0
     mov     r1, r0
     movs    r0, #0x18
     bkpt    #0xAB
     b       hang
 exit_ok:
     movs    r0, #0x18
-    ldr     r1, =0x20026
+    ldr     r1, =0x20026                @ ADP_Stopped_ApplicationExit
     bkpt    #0xAB
 hang:
     b       hang
@@ -88,3 +94,27 @@ HardFault_Handler:
     bkpt    #0xFE
     b       HardFault_Handler
     .size   HardFault_Handler, .-HardFault_Handler
+
+    @ Default weak stubs — tests/benches that need real handlers
+    @ override these by providing a non-weak definition of the symbol.
+
+    .weak   SysTick_Handler
+    .type   SysTick_Handler, %function
+    .thumb_func
+SysTick_Handler:
+    bx      lr
+    .size   SysTick_Handler, .-SysTick_Handler
+
+    .weak   SVC_Handler
+    .type   SVC_Handler, %function
+    .thumb_func
+SVC_Handler:
+    bx      lr
+    .size   SVC_Handler, .-SVC_Handler
+
+    .weak   PendSV_Handler
+    .type   PendSV_Handler, %function
+    .thumb_func
+PendSV_Handler:
+    bx      lr
+    .size   PendSV_Handler, .-PendSV_Handler

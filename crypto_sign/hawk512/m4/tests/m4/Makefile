@@ -15,11 +15,25 @@ OBJCOPY:= $(CROSS)objcopy
 OBJDUMP:= $(CROSS)objdump
 SIZE   := $(CROSS)size
 
-CFLAGS  := -mcpu=cortex-m4 -mthumb -O2 -ffreestanding -nostdlib \
+# Target: Cortex-M4 + Thumb-2 + FPv4-SP-D16 + hard float ABI. This matches
+# the §3.3 methodology spec's architecture/FPU requirements. NOTE: the
+# homebrew arm-none-eabi-gcc package is compiler-only (no newlib bundled),
+# so we use `-ffreestanding -nostdlib` here instead of `--specs=nano.specs`.
+# The full §3.3 setup additionally links newlib-nano + rdimon for
+# semihosting libc support — drop our explicit semihosting trap and use
+# newlib-nano's `printf` once a toolchain bundle (e.g., xpack or ARM's
+# official tar.xz) is installed.
+#
+# Toolchain version: §3.3 says ARM GNU Toolchain 15.2; this harness was
+# verified with 16.1.0 from homebrew. See HANDOFF.md for the deviation.
+ARCH_FLAGS := -mcpu=cortex-m4 -mthumb \
+              -mfpu=fpv4-sp-d16 -mfloat-abi=hard
+
+CFLAGS  := $(ARCH_FLAGS) -O2 -ffreestanding -nostdlib \
            -Wall -Wextra -Wno-unused-function -Wno-unused-variable \
            -fno-common -fdata-sections -ffunction-sections
-ASFLAGS := -mcpu=cortex-m4 -mthumb -Wall
-LDFLAGS := -mcpu=cortex-m4 -mthumb -nostdlib -nostartfiles \
+ASFLAGS := $(ARCH_FLAGS) -Wall
+LDFLAGS := $(ARCH_FLAGS) -nostdlib -nostartfiles \
            -Wl,--gc-sections -T qemu.ld
 
 SRC_DIR := ../..
