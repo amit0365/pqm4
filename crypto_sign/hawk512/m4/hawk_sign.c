@@ -233,6 +233,14 @@ extern uint64_t prof_sig_gauss_cyc;      extern uint32_t prof_sig_gauss_calls;
 extern uint64_t prof_sig_gauss_alt_cyc;  extern uint32_t prof_sig_gauss_alt_calls;
 extern uint64_t prof_poly_symbreak_cyc;  extern uint32_t prof_poly_symbreak_calls;
 extern uint64_t prof_encode_sig_cyc;     extern uint32_t prof_encode_sig_calls;
+/* Temporary residual investigation: track previously-untracked sign-path
+ * function calls so we can attribute the ~5024 ticks of "other (residual)". */
+extern uint64_t prof_polysetsmall_cyc;     extern uint32_t prof_polysetsmall_calls;
+extern uint64_t prof_polysetsmall_low_cyc; extern uint32_t prof_polysetsmall_low_calls;
+extern uint64_t prof_polysetsmall_high_cyc;extern uint32_t prof_polysetsmall_high_calls;
+extern uint64_t prof_pointwise_mul_cyc;    extern uint32_t prof_pointwise_mul_calls;
+extern uint64_t prof_pointwise_fused_cyc;  extern uint32_t prof_pointwise_fused_calls;
+extern uint64_t prof_poly_snorm_cyc;       extern uint32_t prof_poly_snorm_calls;
 #  define PROF_CALL(name, call) do { \
       cyc_snap_t _p_t0 = cyc_snap_ext(); \
       call; \
@@ -1543,15 +1551,15 @@ sign_finish_inner(unsigned logn, int use_shake,
 		uint16_t *w2 = w1 + n;
 		uint16_t *w3 = w2 + n;
 		if (priv_decoded) {
-			mq18433_poly_set_small(logn, w1, g);
+			PROF_CALL(polysetsmall, mq18433_poly_set_small(logn, w1, g));
 		} else {
-			mq18433_poly_set_small_inplace_low(logn, w1);
+			PROF_CALL(polysetsmall_low, mq18433_poly_set_small_inplace_low(logn, w1));
 		}
-		mq18433_poly_set_small_inplace_high(logn, w2);
+		PROF_CALL(polysetsmall_high, mq18433_poly_set_small_inplace_high(logn, w2));
 		mq18433_NTT_pair(logn, w1, w2);
 #if defined(__ARM_FEATURE_DSP) && __ARM_FEATURE_DSP
 		/* Packed-pair montymul: w1[u] = mq18433_montymul(w1[u], w2[u]). */
-		mq18433_pointwise_mul_inplace(w1, w2, n);
+		PROF_CALL(pointwise_mul, mq18433_pointwise_mul_inplace(w1, w2, n));
 #else
 		for (size_t u = 0; u < n; u ++) {
 			w1[u] = mq18433_montymul(w1[u], w2[u]);
@@ -1559,16 +1567,16 @@ sign_finish_inner(unsigned logn, int use_shake,
 #endif
 
 		/* w3 <- 2*(f*x1 - g*x0) = h1 - 2*s1 */
-		mq18433_poly_set_small(logn, w2, x1);
+		PROF_CALL(polysetsmall, mq18433_poly_set_small(logn, w2, x1));
 		if (priv_decoded) {
-			mq18433_poly_set_small(logn, w3, f);
+			PROF_CALL(polysetsmall, mq18433_poly_set_small(logn, w3, f));
 		} else {
-			mq18433_poly_set_small_inplace_high(logn, w3);
+			PROF_CALL(polysetsmall_high, mq18433_poly_set_small_inplace_high(logn, w3));
 		}
 		mq18433_NTT_pair(logn, w2, w3);
 #if defined(__ARM_FEATURE_DSP) && __ARM_FEATURE_DSP
 		/* Packed-pair fused: w3[u] = tomonty(sub(montymul(w2,w3), w1)). */
-		mq18433_pointwise_fused_loop2(w3, w2, w1, n);
+		PROF_CALL(pointwise_fused, mq18433_pointwise_fused_loop2(w3, w2, w1, n));
 #else
 		for (size_t u = 0; u < n; u ++) {
 			w3[u] = mq18433_tomonty(mq18433_sub(
@@ -1576,7 +1584,7 @@ sign_finish_inner(unsigned logn, int use_shake,
 		}
 #endif
 		mq18433_iNTT(logn, w3);
-		mq18433_poly_snorm(logn, w3);
+		PROF_CALL(poly_snorm, mq18433_poly_snorm(logn, w3));
 
 #if HAWK_DEBUG
 		printf("# w = h1 - 2*s1\n");

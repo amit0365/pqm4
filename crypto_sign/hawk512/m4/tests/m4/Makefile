@@ -163,7 +163,8 @@ PROF_WRAPS = -Wl,--wrap=mq18433_NTT_plant \
              -Wl,--wrap=sig_gauss \
              -Wl,--wrap=sig_gauss_alt \
              -Wl,--wrap=poly_symbreak \
-             -Wl,--wrap=encode_sig
+             -Wl,--wrap=encode_sig \
+             -Wl,--wrap=hawk_ntrugen_Hawk_regen_fg
 
 # Profile build needs hawk_sign.c + hawk_vrfy.c compiled with HAWK_PROFILE
 # so PROF_CALL/VPROF_CALL macros expand to cycle-counting wrappers.

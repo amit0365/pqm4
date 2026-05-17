@@ -160,6 +160,19 @@ PROF_RET(int, encode_sig,
          const uint8_t *salt, size_t salt_len, const int16_t *s1),
         (logn, sig, sig_len, salt, salt_len, s1))
 
+PROF_VOID(hawk_ntrugen_Hawk_regen_fg,
+        (unsigned logn, int8_t *restrict f, int8_t *restrict g, const void *seed),
+        (logn, f, g, seed))
+
+/* Temporary residual investigation counters (source-instrumented via PROF_CALL
+ * in hawk_sign.c — these functions are static inline so can't be link-wrapped). */
+uint64_t prof_polysetsmall_cyc;       uint32_t prof_polysetsmall_calls;
+uint64_t prof_polysetsmall_low_cyc;   uint32_t prof_polysetsmall_low_calls;
+uint64_t prof_polysetsmall_high_cyc;  uint32_t prof_polysetsmall_high_calls;
+uint64_t prof_pointwise_mul_cyc;      uint32_t prof_pointwise_mul_calls;
+uint64_t prof_pointwise_fused_cyc;    uint32_t prof_pointwise_fused_calls;
+uint64_t prof_poly_snorm_cyc;         uint32_t prof_poly_snorm_calls;
+
 /* Verify-side counters (call-site instrumented in hawk_vrfy.c). */
 uint64_t prof_mp_NTT_cyc;             uint32_t prof_mp_NTT_calls;
 uint64_t prof_mp_NTT_autoadj_cyc;     uint32_t prof_mp_NTT_autoadj_calls;
@@ -189,6 +202,14 @@ static void prof_reset(void) {
     prof_sig_gauss_alt_cyc = 0;        prof_sig_gauss_alt_calls = 0;
     prof_poly_symbreak_cyc = 0;        prof_poly_symbreak_calls = 0;
     prof_encode_sig_cyc = 0;           prof_encode_sig_calls = 0;
+    prof_hawk_ntrugen_Hawk_regen_fg_cyc = 0;
+    prof_hawk_ntrugen_Hawk_regen_fg_calls = 0;
+    prof_polysetsmall_cyc = 0;         prof_polysetsmall_calls = 0;
+    prof_polysetsmall_low_cyc = 0;     prof_polysetsmall_low_calls = 0;
+    prof_polysetsmall_high_cyc = 0;    prof_polysetsmall_high_calls = 0;
+    prof_pointwise_mul_cyc = 0;        prof_pointwise_mul_calls = 0;
+    prof_pointwise_fused_cyc = 0;      prof_pointwise_fused_calls = 0;
+    prof_poly_snorm_cyc = 0;           prof_poly_snorm_calls = 0;
     prof_mp_NTT_cyc = 0;               prof_mp_NTT_calls = 0;
     prof_mp_NTT_autoadj_cyc = 0;       prof_mp_NTT_autoadj_calls = 0;
     prof_fx32_FFT_cyc = 0;             prof_fx32_FFT_calls = 0;
@@ -303,6 +324,21 @@ int main(void) {
     uint32_t sign_symbrk_calls   = prof_poly_symbreak_calls;
     uint64_t sign_encode_cyc     = prof_encode_sig_cyc;
     uint32_t sign_encode_calls   = prof_encode_sig_calls;
+    uint64_t sign_regen_cyc      = prof_hawk_ntrugen_Hawk_regen_fg_cyc;
+    uint32_t sign_regen_calls    = prof_hawk_ntrugen_Hawk_regen_fg_calls;
+    /* Snapshot residual investigation counters BEFORE verify reset. */
+    uint64_t sign_pss_cyc        = prof_polysetsmall_cyc;
+    uint32_t sign_pss_calls      = prof_polysetsmall_calls;
+    uint64_t sign_pss_low_cyc    = prof_polysetsmall_low_cyc;
+    uint32_t sign_pss_low_calls  = prof_polysetsmall_low_calls;
+    uint64_t sign_pss_high_cyc   = prof_polysetsmall_high_cyc;
+    uint32_t sign_pss_high_calls = prof_polysetsmall_high_calls;
+    uint64_t sign_pwm_cyc        = prof_pointwise_mul_cyc;
+    uint32_t sign_pwm_calls      = prof_pointwise_mul_calls;
+    uint64_t sign_pwf_cyc        = prof_pointwise_fused_cyc;
+    uint32_t sign_pwf_calls      = prof_pointwise_fused_calls;
+    uint64_t sign_snorm_cyc      = prof_poly_snorm_cyc;
+    uint32_t sign_snorm_calls    = prof_poly_snorm_calls;
 
     /* === Verify === */
     prof_reset();
@@ -376,10 +412,27 @@ int main(void) {
     semi_write0("    ("); semi_write_u32(sign_symbrk_calls); semi_write0(" calls)\n");
     report("encode_sig    ", sign_encode_cyc, cyc_sign);
     semi_write0("    ("); semi_write_u32(sign_encode_calls); semi_write0(" calls)\n");
+    report("Hawk_regen_fg ", sign_regen_cyc, cyc_sign);
+    semi_write0("    ("); semi_write_u32(sign_regen_calls); semi_write0(" calls)\n");
+    /* Residual breakdown (source-instrumented via PROF_CALL in hawk_sign.c) */
+    report("poly_set_small", sign_pss_cyc, cyc_sign);
+    semi_write0("    ("); semi_write_u32(sign_pss_calls); semi_write0(" calls)\n");
+    report("poly_set_small_low", sign_pss_low_cyc, cyc_sign);
+    semi_write0("    ("); semi_write_u32(sign_pss_low_calls); semi_write0(" calls)\n");
+    report("poly_set_small_high", sign_pss_high_cyc, cyc_sign);
+    semi_write0("    ("); semi_write_u32(sign_pss_high_calls); semi_write0(" calls)\n");
+    report("pointwise_mul ", sign_pwm_cyc, cyc_sign);
+    semi_write0("    ("); semi_write_u32(sign_pwm_calls); semi_write0(" calls)\n");
+    report("pointwise_fused", sign_pwf_cyc, cyc_sign);
+    semi_write0("    ("); semi_write_u32(sign_pwf_calls); semi_write0(" calls)\n");
+    report("poly_snorm    ", sign_snorm_cyc, cyc_sign);
+    semi_write0("    ("); semi_write_u32(sign_snorm_calls); semi_write0(" calls)\n");
     uint64_t sign_other = cyc_sign - sign_ntt_cyc - sign_ntt_pair_cyc - sign_intt_cyc
                         - sign_montymul_cyc - sign_keccak_cyc
                         - sign_extr_cyc - sign_basis_cyc - sign_gauss_cyc
-                        - sign_symbrk_cyc - sign_encode_cyc;
+                        - sign_symbrk_cyc - sign_encode_cyc - sign_regen_cyc
+                        - sign_pss_cyc - sign_pss_low_cyc - sign_pss_high_cyc
+                        - sign_pwm_cyc - sign_pwf_cyc - sign_snorm_cyc;
     report("other (residual)", sign_other, cyc_sign);
     semi_write0("\n");
 
