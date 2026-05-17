@@ -16,7 +16,13 @@
 #include "plant_18433.h"
 #define mq18433_NTT       mq18433_NTT_plant
 #define mq18433_iNTT      mq18433_iNTT_plant
-#define mq18433_montymul  mq18433_montymul_plant
+/* mq18433_montymul is NOT redefined here: the static-inline definition in
+ * modq.h (single Montgomery reduction) inlines at the per-coefficient
+ * pointwise call sites in this file, saving a `bl`/`bx lr` plus four
+ * loop-invariant constant loads per call (~16 cyc/call × ~1024 calls
+ * per sign). The asm-side mq18433_NTT_plant / mq18433_iNTT_plant still
+ * use the packed Plantard kernel internally; this define only
+ * controls the standalone single-coefficient entry point. */
 #endif
 
 /* Profiling hooks (off by default). When HAWK_PROFILE is defined to

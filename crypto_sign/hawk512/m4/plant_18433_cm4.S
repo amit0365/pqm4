@@ -3,9 +3,13 @@
  * Q=18433 Plantard/Montgomery NTT entry points.
  *
  * Provides:
- *   mq18433_NTT_plant(unsigned logn, uint16_t *a)        — TODO (not yet impl)
- *   mq18433_iNTT_plant(unsigned logn, uint16_t *a)       — TODO (not yet impl)
- *   mq18433_montymul_plant(uint32_t x, uint32_t y)       — done, cross-check pending
+ *   mq18433_NTT_plant(unsigned logn, uint16_t *a)
+ *   mq18433_iNTT_plant(unsigned logn, uint16_t *a)
+ *   mq18433_montymul_plant(uint32_t x, uint32_t y)
+ *
+ * Cross-checked byte-identical to modq.h's Zq(NTT)/Zq(iNTT)/Zq(montymul)
+ * over logn = 1..10 (HAWK-512 and HAWK-1024) via tests/m4/test_ntt.c
+ * and tests/m4/test_montymul.c.
  *
  * SPEC ADHERENCE
  * --------------
@@ -40,21 +44,23 @@
  *     add(x1, x2'):  s = x1 + x2'   (in [2..2Q]).  If s > Q, s -= Q.
  *     sub(x1, x2'):  d = x1 - x2'.  If d <= 0, d += Q.  Maps zero to Q.
  *
- * STATUS (this file)
- * ------------------
- *   - mq18433_montymul_plant is implemented and pending cross-check
- *     against modq.h's Zq(montymul) under QEMU semihosting.
- *   - mq18433_NTT_plant / mq18433_iNTT_plant are NOT YET WRITTEN. The
- *     scalar v1 of NTT in this file's predecessor had a register
- *     allocation bug (clobbered GM_base mid-loop) that was caught
- *     before commit. Re-implementation is gated on having the cross-
- *     check harness running so we can iterate per-layer.
+ * PACKING STRATEGY
+ * ----------------
+ * Layers with ht >= 2 (HT_bytes >= 4) use SAME-TWIDDLE packing:
+ *   (a[k1], a[k1+1]) packed into r0, (a[k2], a[k2+1]) into r1, twiddle s
+ *   shared across both lanes — smulbb/smultb fuse unpack+multiply.
  *
- *     Until they ship, plant_18433.c (C reference) is the source of
- *     truth for the NTT path even on M4 — its function bodies are
- *     guarded by !__ARM_FEATURE_DSP, but until this file provides
- *     mq18433_NTT_plant the guard must invert (or hawk_sign.c must
- *     compile with HAWK_PLANT_NTT undefined on M4).
+ * The LAST layer of NTT and FIRST layer of iNTT (stride = 1 halfword)
+ * use CROSS-COEFFICIENT packing: blocks u=2i and u=2i+1 share the
+ * packed kernel, with each lane carrying its OWN twiddle (smulbb /
+ * smultt). The single-butterfly fallback runs only at logn==1.
+ *
+ * Frame-level optimizations applied on top of the inner kernel:
+ *   - The explicit "advance p_k1 by 4 bytes" at the end of every v-loop
+ *     is folded into the last store via post-indexed writeback.
+ *   - The scalar-layer u-loops keep u_remaining in r14 and p_GM/p_iGM
+ *     in r8 across the loop body (no per-iter ldr/str against the
+ *     stack-spilled copies).
  */
 
 #if defined(__ARM_FEATURE_DSP) && __ARM_FEATURE_DSP
@@ -223,22 +229,11 @@ ntt_vloop_packed:
     lsr     r8, r8, #16                @ r8 = reduced_hi  in [1..Q]
     pkhbt   r1, r3, r8, lsl #16        @ r1 = (reduced_hi << 16) | reduced_lo
 
-    @ Canonical add: per half, if (x1+m) > Q subtract Q.
-    @   sum  = uadd16(x1, m)                 ; in [2..2Q] per half, no overflow
-    @   chk  = usub16(sum, Q+1)              ; GE_h set if sum_h > Q
-    @   sub_ = usub16(sum, Q)                ; sum - Q per half
-    @   res  = sel(sub_, sum)                ; GE → sub_; else sum
-    uadd16  r3, r0, r1                 @ r3 = sum
-    usub16  r8, r3, r7                 @ r8 = sum - Q
-    usub16  r12, r3, r10               @ r12 = sum - (Q+1), GE flags
-    sel     r8, r8, r3                 @ r8 = canon-add result
-    str.w   r8, [r11]                  @ a[k1..k1+1] = canon-add result
-
-    @ Canonical sub: per half, x1 - m mod Q in [1..Q] with 0 ⇒ Q.
-    @ Sequence (using only USUB16's "no-borrow" flag is hard because
-    @ the following UADD16 clobbers GE; instead we use UADD16's
-    @ overflow GE flag, which is set precisely when the USUB16 had a
-    @ borrow — i.e., m < x1):
+    @ Canonical sub FIRST (no writeback on r11): per half, x1 - m mod Q
+    @ in [1..Q] with 0 ⇒ Q. Sequence (using only USUB16's "no-borrow"
+    @ flag is hard because the following UADD16 clobbers GE; instead we
+    @ use UADD16's overflow GE flag, which is set precisely when the
+    @ USUB16 had a borrow — i.e., m < x1):
     @
     @   y      = usub16(m, x1)             ; m - x1 (uint16 wrap)
     @   y_plus = uadd16(y,  Q_packed)      ; y + Q. Overflows iff y wrapped,
@@ -252,8 +247,20 @@ ntt_vloop_packed:
     ssub16  r3, r7, r3
     str.w   r3, [r11, r9]              @ a[k2..k2+1] = canon-sub result
 
-    @ Advance p_k1 by 4 bytes (2 halfwords = next packed pair)
-    adds    r11, r11, #4
+    @ Canonical add: per half, if (x1+m) > Q subtract Q.
+    @   sum  = uadd16(x1, m)                 ; in [2..2Q] per half, no overflow
+    @   chk  = usub16(sum, Q+1)              ; GE_h set if sum_h > Q
+    @   sub_ = usub16(sum, Q)                ; sum - Q per half
+    @   res  = sel(sub_, sum)                ; GE → sub_; else sum
+    @
+    @ Stored with post-inc writeback so the explicit `adds r11, #4`
+    @ at loop tail is folded in (1 cycle / packed v-iter).
+    uadd16  r3, r0, r1                 @ r3 = sum
+    usub16  r8, r3, r7                 @ r8 = sum - Q
+    usub16  r12, r3, r10               @ r12 = sum - (Q+1), GE flags
+    sel     r8, r8, r3                 @ r8 = canon-add result
+    str.w   r8, [r11], #4              @ a[k1..k1+1] = canon-add result; r11+=4
+
     subs    r14, r14, #1
     bne     ntt_vloop_packed
 
@@ -270,14 +277,80 @@ ntt_vloop_packed:
     b       ntt_layer_done
 
 @ ---------- SCALAR u-loop (ht == 1, last layer) ----------
-@ One butterfly per block, k2 = k1 + 2 bytes.
+@ Two butterflies per packed iter via CROSS-COEFFICIENT packing:
+@ blocks u=2i and u=2i+1 (adjacent in memory at HT_bytes=2) processed
+@ together, packing (x1_a, x1_b) into r3 and (x2_a, x2_b) into r1.
+@ The same Plantard kernel that already runs in the ht>=2 path applies
+@ per lane (Q < 2^15 makes signed multiply == unsigned).
+@
+@ Falls back to single-butterfly when m == 1 (only for logn==1).
 ntt_uloop_scalar:
+    ldr     r0, [sp, #0]               @ u_remaining = m
+    cmp     r0, #1
+    beq     ntt_scalar_single          @ m == 1 (logn==1): single butterfly fallback
+
+    @ m is even (m = 2^(logn-1) >= 2 for logn>=2). Process pairs.
+    lsr     r14, r0, #1                @ v_remaining = m/2 packed iters
+    ldr     r8, [sp, #12]              @ r8 = p_GM, held across the loop body
+                                       @ (no scratch inside body conflicts).
+
+ntt_vloop_scalar_packed:
+    ldr     r2, [r8], #4               @ r2 = (s_a) | (s_b << 16); p_GM += 2 halfwords
+    ldr     r0, [r11]                  @ word0 = (x1_a) | (x2_a << 16)
+    ldr     r1, [r11, #4]              @ word1 = (x1_b) | (x2_b << 16)
+
+    @ Repack: r3 = x1_packed = (x1_a, x1_b); r1 = x2_packed = (x2_a, x2_b).
+    pkhbt   r3, r0, r1, lsl #16        @ r3 = x1_a | (x1_b << 16)
+    pkhtb   r1, r1, r0, asr #16        @ r1 = x2_a | (x2_b << 16)
+
+    @ Plantard kernel: m = montymul(x2, s) per lane → r1 = packed reduced.
+    @ Each lane has its OWN twiddle (s_a in low, s_b in high), unlike the
+    @ ht>=2 path that shares one twiddle across both lanes. So use
+    @ smulbb (bot*bot = x2_a * s_a) and smultt (top*top = x2_b * s_b).
+    smulbb  r0, r1, r2                 @ c_lo = x2_a * s_a
+    smultt  r12, r1, r2                @ c_hi = x2_b * s_b
+    mul     r0, r0, r4
+    mul     r12, r12, r4
+    lsr     r0, r0, #16
+    lsr     r12, r12, #16
+    mla     r0, r0, r5, r6
+    mla     r12, r12, r5, r6
+    lsr     r0, r0, #16
+    lsr     r12, r12, #16
+    pkhbt   r1, r0, r12, lsl #16       @ r1 = m_packed
+
+    @ canon-sub: r0 = canonical(x1 - m) per lane
+    usub16  r0, r1, r3
+    uadd16  r12, r0, r7
+    sel     r0, r12, r0
+    ssub16  r0, r7, r0                 @ r0 = canon-sub packed
+
+    @ canon-add: r1 = canonical(x1 + m) per lane (r3 dies here)
+    uadd16  r3, r3, r1
+    usub16  r1, r3, r7
+    usub16  r12, r3, r10
+    sel     r1, r1, r3                 @ r1 = canon-add packed
+
+    @ Interleave back to the memory layout (k1_a, k2_a, k1_b, k2_b):
+    @   word0 = canon_add_lo | (canon_sub_lo << 16) → a[2u..2u+1]
+    @   word1 = canon_add_hi | (canon_sub_hi << 16) → a[2u+2..2u+3]
+    pkhbt   r3, r1, r0, lsl #16        @ r3 = word0
+    pkhtb   r12, r0, r1, asr #16       @ r12 = word1
+    str     r3, [r11], #4              @ store word0, r11+=4
+    str     r12, [r11], #4             @ store word1, r11+=4
+
+    subs    r14, r14, #1
+    bne     ntt_vloop_scalar_packed
+
+    str     r8, [sp, #12]              @ stash advanced p_GM back
+    b       ntt_layer_done
+
+@ Single-butterfly fallback for m == 1 (logn==1 only).
+ntt_scalar_single:
     ldr     r8, [sp, #12]
     ldrh    r2, [r8], #2
     str     r8, [sp, #12]
 
-ntt_v_scalar_one:
-    @ Single scalar butterfly at p_k1=k1, k2=p_k1+2.
     ldrh    r0, [r11]                  @ x1
     ldrh    r1, [r11, #2]              @ x2
 
@@ -297,13 +370,7 @@ ntt_v_scalar_one:
     addle   r0, r0, r5
 
     strh    r3, [r11], #2              @ a[k1]
-    strh    r0, [r11], #2              @ a[k2]; r11 now at next block start
-
-    @ u_remaining--
-    ldr     r0, [sp, #0]
-    subs    r0, r0, #1
-    str     r0, [sp, #0]
-    bne     ntt_uloop_scalar
+    strh    r0, [r11], #2              @ a[k2]
 
 ntt_layer_done:
     @ HT_bytes /= 2; m *= 2
@@ -472,9 +539,8 @@ intti_vloop_packed:
     mul     r12, r12, r5               @ r12 = (0 or Q) per half
     uadd16  r3, r3, r12                @ r3 = sum + Q*lsb (both halves even)
     lsr     r3, r3, #1                 @ r3 = half(sum) packed
-    str.w   r3, [r11]                  @ a[k1..k1+1] = half(canon-add)
+    str.w   r3, [r11], #4              @ a[k1..k1+1] = half(canon-add); r11+=4
 
-    adds    r11, r11, #4
     subs    r14, r14, #1
     bne     intti_vloop_packed
 
@@ -491,13 +557,83 @@ intti_vloop_packed:
     b       intti_layer_done
 
 @ ---------- SCALAR u-loop (t == 1, layer 0) ----------
+@ Two butterflies per packed iter via CROSS-COEFFICIENT packing of
+@ adjacent blocks (u=2i, u=2i+1). Falls back to single butterfly when
+@ hm == 1 (logn==1 only).
 intti_uloop_scalar:
+    ldr     r0, [sp, #0]               @ u_remaining = hm
+    cmp     r0, #1
+    beq     intti_scalar_single        @ hm == 1: single fallback (logn==1)
+
+    @ hm even (hm = 2^(logn-1) >= 2 for logn>=2). Process in pairs.
+    lsr     r14, r0, #1                @ v_remaining = hm/2 packed iters
+    ldr     r8, [sp, #12]              @ r8 = p_iGM, held across body
+
+intti_vloop_scalar_packed:
+    ldr     r2, [r8], #4               @ r2 = (s_a) | (s_b << 16)
+    ldr     r0, [r11]                  @ word0 = (x1_a) | (x2_a << 16)
+    ldr     r1, [r11, #4]              @ word1 = (x1_b) | (x2_b << 16)
+
+    @ Repack: r3 = x1_packed (a, b); r1 = x2_packed (a, b).
+    pkhbt   r3, r0, r1, lsl #16        @ r3 = x1_a | (x1_b << 16)
+    pkhtb   r1, r1, r0, asr #16        @ r1 = x2_a | (x2_b << 16)
+
+    @ Canon-sub: r12 = canonical(x1 - x2) packed in [1..Q]. Kept alive
+    @ through canon-add and consumed by Plantard.
+    usub16  r12, r1, r3
+    uadd16  r0, r12, r7
+    sel     r12, r0, r12
+    ssub16  r12, r7, r12               @ r12 = canon-sub packed
+
+    @ Canon-add: r0 = canonical(x1 + x2). x1 (r3) and x2 (r1) die here.
+    uadd16  r0, r3, r1
+    usub16  r3, r0, r7
+    usub16  r1, r0, r10
+    sel     r0, r3, r0                 @ r0 = canon-add packed
+
+    @ half() on r0: r0 = (sum + Q*lsb) >> 1 per lane.
+    add     r3, r6, #1                 @ r3 = 0x00010001
+    and     r3, r0, r3                 @ packed lsb mask
+    mul     r3, r3, r5                 @ lsb * Q packed
+    uadd16  r0, r0, r3                 @ sum + Q*lsb (both halves even)
+    lsr     r0, r0, #1                 @ r0 = half_packed
+
+    @ Plantard kernel: r12 = montymul(s_packed, canon_sub_packed).
+    @ Per-lane twiddles → smulbb / smultt.
+    smulbb  r1, r12, r2                @ c_lo
+    smultt  r3, r12, r2                @ c_hi
+    mul     r1, r1, r4
+    mul     r3, r3, r4
+    lsr     r1, r1, #16
+    lsr     r3, r3, #16
+    mla     r1, r1, r5, r6
+    mla     r3, r3, r5, r6
+    lsr     r1, r1, #16
+    lsr     r3, r3, #16
+    pkhbt   r12, r1, r3, lsl #16       @ r12 = m_packed (new k2 values)
+
+    @ Interleave back to memory layout:
+    @   word0 = a[2u]   | (a[2u+1] << 16) = half_lo | (m_lo << 16)
+    @   word1 = a[2u+2] | (a[2u+3] << 16) = half_hi | (m_hi << 16)
+    pkhbt   r3, r0, r12, lsl #16       @ word0
+    pkhtb   r1, r12, r0, asr #16       @ word1
+    str     r3, [r11], #4
+    str     r1, [r11], #4
+
+    subs    r14, r14, #1
+    bne     intti_vloop_scalar_packed
+
+    str     r8, [sp, #12]              @ stash advanced p_iGM
+    b       intti_layer_done
+
+@ Single-butterfly fallback for hm == 1 (logn==1 only).
+intti_scalar_single:
     ldr     r8, [sp, #12]
     ldrh    r2, [r8], #2
     str     r8, [sp, #12]
 
     ldrh    r0, [r11]                  @ x1
-    ldrh    r1, [r11, #2]              @ x2 (k2 = k1+1 halfword)
+    ldrh    r1, [r11, #2]              @ x2
 
     @ Canon-sub: r3 = canonical(x1 - x2)
     subs    r3, r0, r1
@@ -511,7 +647,7 @@ intti_uloop_scalar:
     mla     r3, r3, r5, r6
     lsr     r3, r3, #16
 
-    @ Canon-add: r0 = canonical(x1 + x2). x1 unused now; reuse r0.
+    @ Canon-add: r0 = canonical(x1 + x2)
     add     r0, r0, r1
     cmp     r0, r5
     it      hi
@@ -523,14 +659,8 @@ intti_uloop_scalar:
     add     r0, r0, r12
     lsr     r0, r0, #1
 
-    strh    r0, [r11], #2              @ a[k1] = half(canon-add)
-    strh    r3, [r11], #2              @ a[k2] = montymul(s, canon-sub)
-
-    @ For t=1, one butterfly per block. r11 now at next block's k1.
-    ldr     r0, [sp, #0]
-    subs    r0, r0, #1
-    str     r0, [sp, #0]
-    bne     intti_uloop_scalar
+    strh    r0, [r11], #2
+    strh    r3, [r11], #2
 
 intti_layer_done:
     @ t_bytes_doubled *= 2; hm /= 2
