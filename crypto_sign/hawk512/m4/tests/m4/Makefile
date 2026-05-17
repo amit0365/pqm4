@@ -167,7 +167,7 @@ PROF_WRAPS = -Wl,--wrap=mq18433_NTT_plant \
 # Profile build needs hawk_sign.c + hawk_vrfy.c compiled with HAWK_PROFILE
 # so PROF_CALL/VPROF_CALL macros expand to cycle-counting wrappers.
 prof_hawk_sign.o: $(SRC_DIR)/hawk_sign.c
-	$(CC) $(SMOKE_CFLAGS) -DHAWK_PROFILE=1 -c $< -o $@
+	$(CC) $(SMOKE_CFLAGS) -DHAWK_PROFILE=1 -DHAWK_MP_ASM_CORTEXM4=1 -c $< -o $@
 prof_hawk_vrfy.o: $(SRC_DIR)/hawk_vrfy.c
 	$(CC) $(SMOKE_CFLAGS) -DHAWK_PROFILE=1 -DHAWK_MP_ASM_CORTEXM4=1 -c $< -o $@
 prof_ng_hawk.o: $(SRC_DIR)/ng_hawk.c
@@ -187,6 +187,12 @@ profile_hawk.elf: startup.o profile_hawk.o libc_stubs.o $(PROF_HAWK_OBJS) \
 
 disasm: test_montymul.elf
 	$(OBJDUMP) -d $< | less
+
+# Disassembly target for the sign object — useful when iterating on the
+# sig_gauss[_alt] inner-loop inline asm in hawk_sign.c.
+disasm-sign: smoke_hawk_sign.o
+	$(OBJDUMP) -d $< -j .text > smoke_hawk_sign.dis
+	@echo "wrote smoke_hawk_sign.dis"
 
 clean:
 	rm -f *.o *.elf

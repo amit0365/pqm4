@@ -549,6 +549,122 @@ static const uint64_t sig_gauss_lo_Hawk_1024[] = {
 #define SG_MAX_LO_Hawk_1024 ((sizeof sig_gauss_lo_Hawk_1024) / sizeof(uint64_t))
 
 /*
+ * Inner CDT-count loop for the Gaussian sampler.
+ *
+ * Given a 78-bit "uniform" draw split as (hi, lo) where hi is 15 bits
+ * (already masked to 0x7FFF) and lo is 63 bits (already masked to
+ * 0x7FFFFFFFFFFFFFFF), count how many CDT entries are strictly greater
+ * than (hi:lo). The two-phase loop matches the reference body
+ * structure:
+ *   - phase 1 (i = 0..hi_len, stride 2): both (hi, lo) participate
+ *   - phase 2 (i = hi_len..lo_len, stride 2): only contributes when
+ *     hi == 0, in which case the residual lo-only compare adds to r
+ *
+ * The reference implementation merges the two CDT columns via
+ * branchless XOR selection on `p_odd`. Here we instead receive
+ * lo_ptr = tab_lo + pbit and hi_ptr = tab_hi + pbit, so the column
+ * selection is pre-applied via pointer arithmetic on a public input
+ * (pbit is derived from the message-hash target vector t). The
+ * per-iteration math is branchless in (lo, hi) so the timing remains
+ * independent of secret data.
+ *
+ * On Cortex-M4 with the DSP extension we inline an asm body that
+ * exploits the carry-propagating subs/sbcs chain: cc is never
+ * materialized as a 0/1 value — the C flag from the subtract chain
+ * is consumed directly by the conditional `addcc r, r, #1` instruction.
+ */
+#if defined(HAWK_MP_ASM_CORTEXM4) && HAWK_MP_ASM_CORTEXM4 \
+    && defined(__ARM_ARCH_7EM__) && defined(__ARM_FEATURE_DSP) \
+    && __ARM_FEATURE_DSP
+static inline uint32_t
+sig_gauss_cdt_count(uint64_t lo, uint32_t hi,
+	size_t hi_len, size_t lo_len,
+	const uint64_t *lo_ptr, const uint16_t *hi_ptr)
+{
+	uint32_t r = 0;
+	uint32_t lo_l = (uint32_t)lo;
+	uint32_t lo_h = (uint32_t)(lo >> 32);
+	uint32_t tlo_l, tlo_h, thi;
+
+	/* Phase 1: full (hi, lo) compare against (thi, tlo).
+	 *
+	 * After the chain of three subs/sbcs, the C flag is 0 iff
+	 * the overall borrow propagated, i.e., iff (hi:lo) <
+	 * (thi:tlo). The `it cc; addcc r, r, #1` conditional pair
+	 * adds 1 to r exactly when borrow occurred. On Cortex-M4
+	 * IT-block predication is folded with no extra latency, so
+	 * this is the tightest expression of "r += borrow_bit".
+	 *
+	 * We reuse tlo_l / tlo_h / thi as the destinations of the
+	 * subtract chain (we only care about flags, not values),
+	 * saving one register vs. a dedicated scratch. */
+	const uint64_t *lp_end = lo_ptr + hi_len;
+	while (lo_ptr < lp_end) {
+		__asm__ (
+			"ldrd	%[tlo_l], %[tlo_h], [%[lp]], #16\n\t"
+			"ldrh	%[thi], [%[hp]], #4\n\t"
+			"subs	%[tlo_l], %[lo_l], %[tlo_l]\n\t"
+			"sbcs	%[tlo_h], %[lo_h], %[tlo_h]\n\t"
+			"sbcs	%[thi], %[hi], %[thi]\n\t"
+			"it	cc\n\t"
+			"addcc	%[r], %[r], #1"
+			: [r] "+r" (r), [lp] "+r" (lo_ptr), [hp] "+r" (hi_ptr),
+			  [tlo_l] "=&r" (tlo_l), [tlo_h] "=&r" (tlo_h),
+			  [thi] "=&r" (thi)
+			: [lo_l] "r" (lo_l), [lo_h] "r" (lo_h), [hi] "r" (hi)
+			: "cc"
+		);
+	}
+
+	/* Phase 2: lo-only compare, contribution gated by hinz.
+	 * Same flag-trick as phase 1; here we add `hinz` (0 or 1)
+	 * conditionally so the contribution is dropped when hi != 0
+	 * (in which case hinz == 0 and the addcc is a no-op). */
+	uint32_t hinz = (hi - 1) >> 31;
+	lp_end = lo_ptr + (lo_len - hi_len);
+	while (lo_ptr < lp_end) {
+		__asm__ (
+			"ldrd	%[tlo_l], %[tlo_h], [%[lp]], #16\n\t"
+			"subs	%[tlo_l], %[lo_l], %[tlo_l]\n\t"
+			"sbcs	%[tlo_h], %[lo_h], %[tlo_h]\n\t"
+			"it	cc\n\t"
+			"addcc	%[r], %[r], %[hinz]"
+			: [r] "+r" (r), [lp] "+r" (lo_ptr),
+			  [tlo_l] "=&r" (tlo_l), [tlo_h] "=&r" (tlo_h)
+			: [lo_l] "r" (lo_l), [lo_h] "r" (lo_h),
+			  [hinz] "r" (hinz)
+			: "cc"
+		);
+	}
+
+	return r;
+}
+#else
+static inline uint32_t
+sig_gauss_cdt_count(uint64_t lo, uint32_t hi,
+	size_t hi_len, size_t lo_len,
+	const uint64_t *lo_ptr, const uint16_t *hi_ptr)
+{
+	uint32_t r = 0;
+	/* Phase 1: hi-based comparison. */
+	for (size_t i = 0; i < hi_len; i += 2) {
+		uint64_t tlo = lo_ptr[i];
+		uint32_t thi = hi_ptr[i];
+		uint32_t cc = (uint32_t)((lo - tlo) >> 63);
+		r += (hi - thi - cc) >> 31;
+	}
+	/* Phase 2: lo-only comparison, masked by hinz. */
+	uint32_t hinz = (hi - 1) >> 31;
+	for (size_t i = hi_len; i < lo_len; i += 2) {
+		uint64_t tlo = lo_ptr[i];
+		uint32_t cc = (uint32_t)((lo - tlo) >> 63);
+		r += hinz & cc;
+	}
+	return r;
+}
+#endif
+
+/*
  * Generate x with the right Gaussian, for the specified parity bits.
  * x is formally generated with center t/2 and standard deviation sigma_sign
  * (with sigma_sign = 1.010, 1.278 or 1.299, depending on degree); this
@@ -630,10 +746,34 @@ sig_gauss(unsigned logn,
 				uint64_t q[5];
 			} buf;
 			shake_extract(&sc, buf.b, 40);
+			/* Hoist the per-(u,j) byte of the target parity
+			 * vector t. With u in {0,16,32,...} and j*4 in
+			 * {0,4,8,12}, v_base = u + 4j has (v_base & 7) in
+			 * {0, 4}, so all four k=0..3 samples for this
+			 * (u,j) live in the same byte t[v_base>>3] (the
+			 * k-th bit at offset (v_base & 7)+k). Load that
+			 * byte once and shift it down to align bit 0
+			 * with the k=0 sample. */
+			size_t v_base = u + (j << 2);
+			uint32_t pbyte = (uint32_t)t[v_base >> 3]
+				>> (v_base & 7);
 			for (size_t k = 0; k < 4; k ++) {
-				size_t v = u + (j << 2) + k;
+				size_t v = v_base + k;
+				/* The shake output is byte-stream LE, and
+				 * the buf union guarantees natural alignment
+				 * for both q[] (8-byte) and w[] (2-byte).
+				 * On little-endian targets these explicit
+				 * union accesses compile to a single LDRD
+				 * (for lo) and LDRH (for hi); the dec64le /
+				 * dec16le helpers' byte-by-byte fallback is
+				 * unnecessary here. */
+#if HAWK_LE
+				uint64_t lo = buf.q[k];
+				uint32_t hi = buf.w[16 + k];
+#else
 				uint64_t lo = dec64le(buf.b + (k << 3));
 				uint32_t hi = dec16le(buf.b + 32 + (k << 1));
+#endif
 
 				/* Extract sign bit. */
 				uint32_t neg = -(uint32_t)(lo >> 63);
@@ -641,35 +781,19 @@ sig_gauss(unsigned logn,
 				hi &= 0x7FFF;
 
 				/* Use even or odd column depending on
-				   parity of t. */
-				uint32_t pbit = (t[v >> 3] >> (v & 7)) & 1;
-				uint64_t p_odd = -(uint64_t)pbit;
-				uint32_t p_oddw = (uint32_t)p_odd;
+				   parity of t. pbit comes from the (public)
+				   target vector t, so pbit-indexed pointer
+				   selection introduces no secret-data leak;
+				   the cc/r updates below remain branchless
+				   in lo/hi (which DO contain SHAKE-derived
+				   randomness). */
+				uint32_t pbit = (pbyte >> k) & 1;
+				uint32_t p_oddw = -pbit;
+				uint32_t r;
 
-				uint32_t r = 0;
-				for (size_t i = 0; i < hi_len; i += 2) {
-					uint64_t tlo0 = tab_lo[i + 0];
-					uint64_t tlo1 = tab_lo[i + 1];
-					uint64_t tlo = tlo0
-						^ (p_odd & (tlo0 ^ tlo1));
-					uint32_t cc =
-						(uint32_t)((lo - tlo) >> 63);
-					uint32_t thi0 = tab_hi[i + 0];
-					uint32_t thi1 = tab_hi[i + 1];
-					uint32_t thi = thi0
-						^ (p_oddw & (thi0 ^ thi1));
-					r += (hi - thi - cc) >> 31;
-				}
-				uint32_t hinz = (hi - 1) >> 31;
-				for (size_t i = hi_len; i < lo_len; i += 2) {
-					uint64_t tlo0 = tab_lo[i + 0];
-					uint64_t tlo1 = tab_lo[i + 1];
-					uint64_t tlo = tlo0
-						^ (p_odd & (tlo0 ^ tlo1));
-					uint32_t cc =
-						(uint32_t)((lo - tlo) >> 63);
-					r += hinz & cc;
-				}
+				r = sig_gauss_cdt_count(
+					lo, hi, hi_len, lo_len,
+					tab_lo + pbit, tab_hi + pbit);
 
 				/* Multiply by 2 and apply parity. */
 				r = (r << 1) - p_oddw;
@@ -751,48 +875,49 @@ sig_gauss_alt(unsigned logn,
 		} buf;
 		rng(rng_context, buf.b, sizeof buf.b);
 		for (size_t j = 0; j < 4; j ++) {
+			/* Same hoist as in sig_gauss above: the four
+			 * k samples for this (u,j) share the same byte
+			 * of t, since (v_base & 7) is always 0 or 4 with
+			 * 3 < 8 - (v_base & 7), so no byte crossing. */
+			size_t v_base = u + (j << 2);
+			uint32_t pbyte = (uint32_t)t[v_base >> 3]
+				>> (v_base & 7);
 			for (size_t k = 0; k < 4; k ++) {
-				size_t v = u + (j << 2) + k;
+				size_t v = v_base + k;
+				/* Same LE-aligned fast-path as in sig_gauss
+				 * above: on LE targets, union-member access
+				 * lets the compiler emit a single LDRD/LDRH
+				 * (vs. the byte-by-byte dec64le/dec16le
+				 * fallback). Offsets: each k-step advances
+				 * 32 bytes in the lo lane (= 4 uint64_t's),
+				 * and 2 bytes (= 1 uint16_t) in the hi lane;
+				 * each j-step adds 8 bytes (= 1 uint64_t)
+				 * to lo and 8 bytes (= 4 uint16_t's) to hi
+				 * within the 160-byte block. */
+#if HAWK_LE
+				uint64_t lo = buf.q[(k << 2) + j];
+				uint32_t hi = buf.w[64 + (j << 2) + k];
+#else
 				uint64_t lo = dec64le(
 					buf.b + (j << 3) + (k << 5));
 				uint32_t hi = dec16le(
 					buf.b + (j << 3) + 128 + (k << 1));
+#endif
 
 				/* Extract sign bit. */
 				uint32_t neg = -(uint32_t)(lo >> 63);
 				lo &= 0x7FFFFFFFFFFFFFFF;
 				hi &= 0x7FFF;
 
-				/* Use even or odd column depending on
-				   parity of t. */
-				uint32_t pbit = (t[v >> 3] >> (v & 7)) & 1;
-				uint64_t p_odd = -(uint64_t)pbit;
-				uint32_t p_oddw = (uint32_t)p_odd;
+				/* See sig_gauss() above for the rationale
+				   on pbit-indexed pointer selection. */
+				uint32_t pbit = (pbyte >> k) & 1;
+				uint32_t p_oddw = -pbit;
+				uint32_t r;
 
-				uint32_t r = 0;
-				for (size_t i = 0; i < hi_len; i += 2) {
-					uint64_t tlo0 = tab_lo[i + 0];
-					uint64_t tlo1 = tab_lo[i + 1];
-					uint64_t tlo = tlo0
-						^ (p_odd & (tlo0 ^ tlo1));
-					uint32_t cc =
-						(uint32_t)((lo - tlo) >> 63);
-					uint32_t thi0 = tab_hi[i + 0];
-					uint32_t thi1 = tab_hi[i + 1];
-					uint32_t thi = thi0
-						^ (p_oddw & (thi0 ^ thi1));
-					r += (hi - thi - cc) >> 31;
-				}
-				uint32_t hinz = (hi - 1) >> 31;
-				for (size_t i = hi_len; i < lo_len; i += 2) {
-					uint64_t tlo0 = tab_lo[i + 0];
-					uint64_t tlo1 = tab_lo[i + 1];
-					uint64_t tlo = tlo0
-						^ (p_odd & (tlo0 ^ tlo1));
-					uint32_t cc =
-						(uint32_t)((lo - tlo) >> 63);
-					r += hinz & cc;
-				}
+				r = sig_gauss_cdt_count(
+					lo, hi, hi_len, lo_len,
+					tab_lo + pbit, tab_hi + pbit);
 
 				/* Multiply by 2 and apply parity. */
 				r = (r << 1) - p_oddw;
