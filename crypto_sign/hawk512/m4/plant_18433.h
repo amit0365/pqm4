@@ -25,6 +25,12 @@
  * single-Montgomery representation, values in [1..18433]. */
 void mq18433_NTT_plant(unsigned logn, uint16_t *a);
 
+/* Forward NTT on TWO polynomials simultaneously. Functionally equivalent
+ * to calling mq18433_NTT_plant(logn, a) followed by mq18433_NTT_plant(logn,
+ * b), but shares the twiddle loads and prologue/epilogue across both NTTs.
+ * Used by hawk_sign.c's pair-of-NTTs sequences. */
+void mq18433_NTT_pair_plant(unsigned logn, uint16_t *a, uint16_t *b);
+
 /* Inverse NTT (Gentleman-Sande, in-place). */
 void mq18433_iNTT_plant(unsigned logn, uint16_t *a);
 

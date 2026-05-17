@@ -19,6 +19,7 @@
 
 extern void mq18433_NTT_plant(unsigned logn, uint16_t *a);
 extern void mq18433_iNTT_plant(unsigned logn, uint16_t *a);
+extern void mq18433_NTT_pair_plant(unsigned logn, uint16_t *a, uint16_t *b);
 
 /* Simple LCG so the test is deterministic and self-contained. */
 static uint32_t rng_state = 0x42424242u;
@@ -31,6 +32,8 @@ static uint32_t rng_next(void) {
 
 static uint16_t buf_ref[MAXN];
 static uint16_t buf_asm[MAXN];
+static uint16_t buf_ref_b[MAXN];
+static uint16_t buf_asm_b[MAXN];
 
 static int cmp_buffers(const char *label, unsigned logn, size_t N) {
     int mismatches = 0;
@@ -99,6 +102,29 @@ int main(void) {
         mq18433_iNTT(logn, buf_ref);
         mq18433_iNTT_plant(logn, buf_asm);
         total_fail += cmp_buffers("iNTT", logn, N);
+    }
+
+    /* NTT pair sweep: cross-check mq18433_NTT_pair_plant against
+     * two sequential mq18433_NTT calls. */
+    for (unsigned logn = 1; logn <= 10; logn++) {
+        size_t N = (size_t)1 << logn;
+        for (size_t i = 0; i < N; i++) {
+            uint16_t va = (uint16_t)(1u + (rng_next() % Q));
+            uint16_t vb = (uint16_t)(1u + (rng_next() % Q));
+            buf_ref[i] = va;   buf_asm[i] = va;
+            buf_ref_b[i] = vb; buf_asm_b[i] = vb;
+        }
+        mq18433_NTT(logn, buf_ref);
+        mq18433_NTT(logn, buf_ref_b);
+        mq18433_NTT_pair_plant(logn, buf_asm, buf_asm_b);
+        total_fail += cmp_buffers("NTTpair_a", logn, N);
+        /* Reuse cmp by swapping ref/asm pointers for b — quick trick:
+         * copy ref_b into ref and asm_b into asm. */
+        for (size_t i = 0; i < N; i++) {
+            buf_ref[i] = buf_ref_b[i];
+            buf_asm[i] = buf_asm_b[i];
+        }
+        total_fail += cmp_buffers("NTTpair_b", logn, N);
     }
 
     if (total_fail == 0) {

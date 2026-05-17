@@ -152,6 +152,7 @@ profile_hawk.o: profile_hawk.c semihost.h
 	$(CC) $(SMOKE_CFLAGS) -c profile_hawk.c -o $@
 
 PROF_WRAPS = -Wl,--wrap=mq18433_NTT_plant \
+             -Wl,--wrap=mq18433_NTT_pair_plant \
              -Wl,--wrap=mq18433_iNTT_plant \
              -Wl,--wrap=mq18433_montymul_plant \
              -Wl,--wrap=KeccakF1600_StatePermute \
@@ -184,6 +185,40 @@ profile_hawk.elf: startup.o profile_hawk.o libc_stubs.o $(PROF_HAWK_OBJS) \
 	$(CC) $(SMOKE_LDFLAGS) $(PROF_WRAPS) startup.o profile_hawk.o libc_stubs.o $(PROF_HAWK_OBJS) \
 	                       keccakf1600.o plant_asm.o plant_tables.o basis_m2_mul_asm.o -lgcc -o $@
 	@$(SIZE) $@
+
+# Pure-C baseline build: disables every asm gate so the resulting elf
+# runs HAWK with no Plantard asm (HAWK_PLANT_NTT=0), no 31-bit mp_montymul
+# inline asm (HAWK_MP_ASM_CORTEXM4 undefined), no basis_m2_mul asm leaves,
+# and no sig_gauss inline asm. -U__ARM_FEATURE_DSP forces hawk_sign.c's
+# basis_m2_mul body to fall through to its portable "holes" C path.
+PURE_C_CFLAGS = $(CFLAGS) -DHAWK_PLANT_NTT=0 -U__ARM_FEATURE_DSP \
+                -Istubs -I$(SRC_DIR) -I$(SRC_DIR)/../../../mupq/common
+
+pc_%.o: $(SRC_DIR)/%.c
+	$(CC) $(PURE_C_CFLAGS) -c $< -o $@
+
+pc_profile_hawk.o: profile_hawk.c semihost.h
+	$(CC) $(PURE_C_CFLAGS) -c profile_hawk.c -o $@
+
+pc_hawk_sign.o: $(SRC_DIR)/hawk_sign.c
+	$(CC) $(PURE_C_CFLAGS) -DHAWK_PROFILE=1 -c $< -o $@
+pc_hawk_vrfy.o: $(SRC_DIR)/hawk_vrfy.c
+	$(CC) $(PURE_C_CFLAGS) -DHAWK_PROFILE=1 -c $< -o $@
+pc_ng_hawk.o:   $(SRC_DIR)/ng_hawk.c
+	$(CC) $(PURE_C_CFLAGS) -DHAWK_PROFILE=1 -c $< -o $@
+
+PC_HAWK_OBJS = pc_hawk_sign.o pc_hawk_vrfy.o pc_ng_hawk.o \
+               pc_hawk_kgen.o pc_ng_fxp.o pc_ng_mp31.o \
+               pc_ng_ntru.o pc_ng_poly.o pc_ng_zint31.o pc_sha3.o
+
+pure_c_profile.elf: startup.o pc_profile_hawk.o libc_stubs.o $(PC_HAWK_OBJS) \
+                    keccakf1600.o qemu.ld
+	$(CC) $(SMOKE_LDFLAGS) $(PROF_WRAPS) startup.o pc_profile_hawk.o libc_stubs.o $(PC_HAWK_OBJS) \
+	                       keccakf1600.o -lgcc -o $@
+	@$(SIZE) $@
+
+run-pure-c-profile: pure_c_profile.elf
+	$(QEMU) $(ICOUNT) -kernel pure_c_profile.elf
 
 disasm: test_montymul.elf
 	$(OBJDUMP) -d $< | less

@@ -80,6 +80,17 @@ mq18433_NTT_plant(unsigned logn, uint16_t *a)
 	}
 }
 
+/* Forward NTT on two polynomials simultaneously. Portable C fallback —
+ * just calls the single-polynomial NTT twice. The M4 asm version in
+ * plant_18433_cm4.S shares twiddle loads and prologue/epilogue across the
+ * two NTTs for a measurable cycle saving. */
+void
+mq18433_NTT_pair_plant(unsigned logn, uint16_t *a, uint16_t *b)
+{
+	mq18433_NTT_plant(logn, a);
+	mq18433_NTT_plant(logn, b);
+}
+
 /* Inverse NTT — Gentleman-Sande, in-place. Mirrors Zq(iNTT). */
 void
 mq18433_iNTT_plant(unsigned logn, uint16_t *a)

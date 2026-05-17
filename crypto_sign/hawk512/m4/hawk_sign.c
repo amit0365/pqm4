@@ -16,6 +16,7 @@
 #include "plant_18433.h"
 #define mq18433_NTT       mq18433_NTT_plant
 #define mq18433_iNTT      mq18433_iNTT_plant
+#define mq18433_NTT_pair  mq18433_NTT_pair_plant
 /* mq18433_montymul is NOT redefined here: the static-inline definition in
  * modq.h (single Montgomery reduction) inlines at the per-coefficient
  * pointwise call sites in this file, saving a `bl`/`bx lr` plus four
@@ -23,6 +24,13 @@
  * per sign). The asm-side mq18433_NTT_plant / mq18433_iNTT_plant still
  * use the packed Plantard kernel internally; this define only
  * controls the standalone single-coefficient entry point. */
+#else
+/* Pure-C fallback path: no pair function — emit two single-NTT calls. */
+static inline void
+mq18433_NTT_pair(unsigned logn, uint16_t *a, uint16_t *b) {
+	mq18433_NTT(logn, a);
+	mq18433_NTT(logn, b);
+}
 #endif
 
 /* Profiling hooks (off by default). When HAWK_PROFILE is defined to
@@ -1355,8 +1363,7 @@ sign_finish_inner(unsigned logn, int use_shake,
 			mq18433_poly_set_small_inplace_low(logn, w1);
 		}
 		mq18433_poly_set_small_inplace_high(logn, w2);
-		mq18433_NTT(logn, w1);
-		mq18433_NTT(logn, w2);
+		mq18433_NTT_pair(logn, w1, w2);
 		for (size_t u = 0; u < n; u ++) {
 			w1[u] = mq18433_montymul(w1[u], w2[u]);
 		}
@@ -1368,8 +1375,7 @@ sign_finish_inner(unsigned logn, int use_shake,
 		} else {
 			mq18433_poly_set_small_inplace_high(logn, w3);
 		}
-		mq18433_NTT(logn, w2);
-		mq18433_NTT(logn, w3);
+		mq18433_NTT_pair(logn, w2, w3);
 		for (size_t u = 0; u < n; u ++) {
 			w3[u] = mq18433_tomonty(mq18433_sub(
 				mq18433_montymul(w2[u], w3[u]), w1[u]));

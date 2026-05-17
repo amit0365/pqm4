@@ -120,6 +120,7 @@ uint64_t cyc_elapsed_ext(cyc_snap_t t0, cyc_snap_t t1) {
     }
 
 PROF_VOID(mq18433_NTT_plant,         (unsigned logn, uint16_t *a), (logn, a))
+PROF_VOID(mq18433_NTT_pair_plant,    (unsigned logn, uint16_t *a, uint16_t *b), (logn, a, b))
 PROF_VOID(mq18433_iNTT_plant,        (unsigned logn, uint16_t *a), (logn, a))
 PROF_U32 (mq18433_montymul_plant,    (uint32_t x, uint32_t y),     (x, y))
 PROF_VOID(KeccakF1600_StatePermute,  (uint64_t *state), (state))
@@ -176,6 +177,7 @@ uint64_t prof_recover_G_cyc;          uint32_t prof_recover_G_calls;
 
 static void prof_reset(void) {
     prof_mq18433_NTT_plant_cyc = 0;       prof_mq18433_NTT_plant_calls = 0;
+    prof_mq18433_NTT_pair_plant_cyc = 0;  prof_mq18433_NTT_pair_plant_calls = 0;
     prof_mq18433_iNTT_plant_cyc = 0;      prof_mq18433_iNTT_plant_calls = 0;
     prof_mq18433_montymul_plant_cyc = 0;  prof_mq18433_montymul_plant_calls = 0;
     prof_KeccakF1600_StatePermute_cyc = 0;     prof_KeccakF1600_StatePermute_calls = 0;
@@ -280,12 +282,14 @@ int main(void) {
 
     /* Snapshot of sign-side profile counters. */
     uint64_t sign_ntt_cyc        = prof_mq18433_NTT_plant_cyc;
+    uint64_t sign_ntt_pair_cyc   = prof_mq18433_NTT_pair_plant_cyc;
     uint64_t sign_intt_cyc       = prof_mq18433_iNTT_plant_cyc;
     uint64_t sign_montymul_cyc   = prof_mq18433_montymul_plant_cyc;
     uint64_t sign_keccak_cyc     = prof_KeccakF1600_StatePermute_cyc
                                  + prof_KeccakF1600_StateXORBytes_cyc
                                  + prof_KeccakF1600_StateExtractBytes_cyc;
     uint32_t sign_ntt_calls      = prof_mq18433_NTT_plant_calls;
+    uint32_t sign_ntt_pair_calls = prof_mq18433_NTT_pair_plant_calls;
     uint32_t sign_intt_calls     = prof_mq18433_iNTT_plant_calls;
     uint32_t sign_montymul_calls = prof_mq18433_montymul_plant_calls;
     uint32_t sign_keccak_calls   = prof_KeccakF1600_StatePermute_calls;
@@ -354,6 +358,8 @@ int main(void) {
     semi_write0(" ticks total) ===\n");
     report("NTT      ", sign_ntt_cyc, cyc_sign);
     semi_write0("    ("); semi_write_u32(sign_ntt_calls); semi_write0(" calls)\n");
+    report("NTT_pair ", sign_ntt_pair_cyc, cyc_sign);
+    semi_write0("    ("); semi_write_u32(sign_ntt_pair_calls); semi_write0(" calls)\n");
     report("iNTT     ", sign_intt_cyc, cyc_sign);
     semi_write0("    ("); semi_write_u32(sign_intt_calls); semi_write0(" calls)\n");
     report("montymul ", sign_montymul_cyc, cyc_sign);
@@ -370,7 +376,7 @@ int main(void) {
     semi_write0("    ("); semi_write_u32(sign_symbrk_calls); semi_write0(" calls)\n");
     report("encode_sig    ", sign_encode_cyc, cyc_sign);
     semi_write0("    ("); semi_write_u32(sign_encode_calls); semi_write0(" calls)\n");
-    uint64_t sign_other = cyc_sign - sign_ntt_cyc - sign_intt_cyc
+    uint64_t sign_other = cyc_sign - sign_ntt_cyc - sign_ntt_pair_cyc - sign_intt_cyc
                         - sign_montymul_cyc - sign_keccak_cyc
                         - sign_extr_cyc - sign_basis_cyc - sign_gauss_cyc
                         - sign_symbrk_cyc - sign_encode_cyc;

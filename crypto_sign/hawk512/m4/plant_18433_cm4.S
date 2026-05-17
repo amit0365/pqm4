@@ -676,4 +676,327 @@ intti_done:
     bx      lr
     .size   mq18433_iNTT_plant, .-mq18433_iNTT_plant
 
+
+@ -------------------------------------------------------------------
+@ void mq18433_NTT_pair_plant(unsigned logn, uint16_t *a, uint16_t *b);
+@
+@ Performs the forward NTT on TWO polynomials a and b simultaneously.
+@ For each butterfly group at each layer, the twiddle ω is loaded ONCE
+@ from the GM table and applied to BOTH a and b before advancing to the
+@ next twiddle.
+@
+@ Output is byte-identical to two sequential mq18433_NTT_plant calls
+@ on a and b — both polynomials end in canonical [1..Q] form.
+@
+@ Register layout — to fit p_k1_b in a register we replace one usage of
+@ r12 in each inner body:
+@   - Packed body: `usub16 r12, r3, r10` (sets GE flags, target was dead
+@     after) becomes `usub16 r0, r3, r10` since r0 is dead at that point.
+@   - Scalar body: substitute r9 → as the high-lane scratch throughout
+@     (was r12 in the single-NTT scalar body). r9 is HT_bytes and is
+@     not used inside the scalar body — offsets are fixed `#4`. r9
+@     gets clobbered, so we restore it to #2 after the loop (or simply
+@     branch directly to done, since this is always the LAST layer).
+@
+@ Result: r12 carries p_k1_b across every body iter and across layer
+@ transitions. The merged v-loop processes one a-butterfly + one
+@ b-butterfly per iter, sharing twiddle r2 and the loop counter r14.
+@
+@ Stack frame (24 bytes, 8-byte aligned):
+@   [sp+0]   u_remaining  (per-u-iter; reset at layer start)
+@   [sp+4]   a_base       (constant for the call)
+@   [sp+8]   m_current    (per-layer; doubles each layer transition)
+@   [sp+12]  p_GM         (advances by 2 bytes per u-iter)
+@   [sp+16]  b_base       (constant for the call; reloaded into r12 each layer)
+@
+@ Register map:
+@   r0,r1   x1, x2 (packed) / scratch (r0 reused for GE-only usub16)
+@   r2      s (twiddle, shared across a and b)
+@   r3,r8   inner scratch (r8 holds p_GM in the scalar merged loop)
+@   r4      Q0I
+@   r5      Q
+@   r6      QA
+@   r7      Q_packed
+@   r9      HT_bytes (packed body) / high-lane scratch (scalar body)
+@   r10     Qp1_packed
+@   r11     p_k1_a
+@   r12     p_k1_b
+@   r14     v_remaining
+@ -------------------------------------------------------------------
+    .global mq18433_NTT_pair_plant
+    .type   mq18433_NTT_pair_plant, %function
+    .thumb_func
+    .align  2
+mq18433_NTT_pair_plant:
+    push    {r4-r11, lr}
+    sub     sp, sp, #24
+
+    @ Scalar constants
+    movw    r4, #0x47FF
+    movt    r4, #0xEBC0                @ r4 = Q0I
+    movw    r5, #18433                 @ r5 = Q
+    mov.w   r6, #0x10000               @ r6 = QA
+
+    @ Packed constants
+    pkhbt   r7, r5, r5, lsl #16        @ r7 = Q_packed
+    adds    r3, r5, #1
+    pkhbt   r10, r3, r3, lsl #16       @ r10 = Qp1_packed
+
+    @ Stash bases
+    str     r1, [sp, #4]               @ a_base
+    str     r2, [sp, #16]              @ b_base
+
+    @ Initialize p_GM = &mq18433_GM[1]
+    movw    r3, #:lower16:mq18433_GM
+    movt    r3, #:upper16:mq18433_GM
+    adds    r3, r3, #2
+    str     r3, [sp, #12]
+
+    @ HT_bytes_initial = 1 << logn
+    movs    r9, #1
+    lsls    r9, r9, r0
+
+    @ m_initial = 1
+    movs    r3, #1
+    str     r3, [sp, #8]
+
+nttp_layer:
+    cmp     r9, #2
+    blt.w   nttp_done
+
+    @ Layer setup: r11 = a_base, r12 = b_base, u_remaining = m
+    ldr     r11, [sp, #4]
+    ldr     r12, [sp, #16]
+    ldr     r3, [sp, #8]
+    str     r3, [sp, #0]               @ u_remaining = m
+
+    @ Branch: HT_bytes >= 4 ⇒ packed; HT_bytes == 2 ⇒ scalar
+    cmp     r9, #4
+    blt.w   nttp_uloop_scalar
+
+@ ---------- PACKED u-loop (ht >= 2) ----------
+nttp_uloop_packed:
+    @ Shared ω load (once for both a and b)
+    ldr     r8, [sp, #12]
+    ldrh    r2, [r8], #2
+    str     r8, [sp, #12]
+
+    @ v_remaining = ht/2 = HT_bytes/4
+    lsr     r14, r9, #2
+
+@ === MERGED v-loop: process one a-butterfly + one b-butterfly per iter ===
+@ The two bodies share twiddle r2 and constants r4-r7, r10. The first body
+@ (a) advances r11; the second body (b) advances r12. Loop control runs
+@ once per merged iter (was twice in the separate two-loop layout).
+nttp_vloop_packed_merged:
+    @ ---- a's butterfly (uses r11) ----
+    ldr.w   r0, [r11]
+    ldr.w   r1, [r11, r9]
+    smulbb  r3, r1, r2
+    smultb  r8, r1, r2
+    mul     r3, r3, r4
+    mul     r8, r8, r4
+    lsr     r3, r3, #16
+    lsr     r8, r8, #16
+    mla     r3, r3, r5, r6
+    mla     r8, r8, r5, r6
+    lsr     r3, r3, #16
+    lsr     r8, r8, #16
+    pkhbt   r1, r3, r8, lsl #16
+    usub16  r3, r1, r0
+    uadd16  r8, r3, r7
+    sel     r3, r8, r3
+    ssub16  r3, r7, r3
+    str.w   r3, [r11, r9]
+    uadd16  r3, r0, r1
+    usub16  r8, r3, r7
+    usub16  r0, r3, r10
+    sel     r8, r8, r3
+    str.w   r8, [r11], #4
+
+    @ ---- b's butterfly (uses r12) ----
+    ldr.w   r0, [r12]
+    ldr.w   r1, [r12, r9]
+    smulbb  r3, r1, r2
+    smultb  r8, r1, r2
+    mul     r3, r3, r4
+    mul     r8, r8, r4
+    lsr     r3, r3, #16
+    lsr     r8, r8, #16
+    mla     r3, r3, r5, r6
+    mla     r8, r8, r5, r6
+    lsr     r3, r3, #16
+    lsr     r8, r8, #16
+    pkhbt   r1, r3, r8, lsl #16
+    usub16  r3, r1, r0
+    uadd16  r8, r3, r7
+    sel     r3, r8, r3
+    ssub16  r3, r7, r3
+    str.w   r3, [r12, r9]
+    uadd16  r3, r0, r1
+    usub16  r8, r3, r7
+    usub16  r0, r3, r10
+    sel     r8, r8, r3
+    str.w   r8, [r12], #4
+
+    subs    r14, r14, #1
+    bne     nttp_vloop_packed_merged
+
+    @ Advance r11 and r12 past second-half cells to next u-block start
+    add     r11, r11, r9
+    add     r12, r12, r9
+
+    @ u_remaining--
+    ldr     r0, [sp, #0]
+    subs    r0, r0, #1
+    str     r0, [sp, #0]
+    bne     nttp_uloop_packed
+    b       nttp_layer_done
+
+@ ---------- SCALAR u-loop (ht == 1, last layer) ----------
+@ Two butterflies per iter via cross-coefficient packing. r9 is repurposed
+@ as the high-lane scratch (no [r11, r9] addressing here — offsets are
+@ fixed `#4`); r12 carries p_k1_b. p_GM lives in r8 across the merged
+@ loop. Since this is the last layer, we branch directly to nttp_done
+@ at the end and skip the layer_done bookkeeping.
+nttp_uloop_scalar:
+    ldr     r0, [sp, #0]
+    cmp     r0, #1
+    beq     nttp_scalar_single         @ m == 1 fallback (logn==1)
+
+    @ v_remaining (packed) = m/2
+    lsr     r14, r0, #1
+
+    @ Load p_GM into r8 (held across the loop).
+    ldr     r8, [sp, #12]
+
+@ === Merged scalar v-loop: a-pair + b-pair per iter (cross-coef packing) ===
+@ Sharing the same ω pair (4-byte read advances p_GM by 4 = 2 halfwords).
+nttp_vloop_scalar_merged:
+    ldr     r2, [r8], #4               @ shared ω pair (s_a | s_b<<16)
+
+    @ ---- a's pair butterfly (r11 = p_k1_a) ----
+    ldr     r0, [r11]
+    ldr     r1, [r11, #4]
+    pkhbt   r3, r0, r1, lsl #16
+    pkhtb   r1, r1, r0, asr #16
+    smulbb  r0, r1, r2
+    smultt  r9, r1, r2
+    mul     r0, r0, r4
+    mul     r9, r9, r4
+    lsr     r0, r0, #16
+    lsr     r9, r9, #16
+    mla     r0, r0, r5, r6
+    mla     r9, r9, r5, r6
+    lsr     r0, r0, #16
+    lsr     r9, r9, #16
+    pkhbt   r1, r0, r9, lsl #16
+    usub16  r0, r1, r3
+    uadd16  r9, r0, r7
+    sel     r0, r9, r0
+    ssub16  r0, r7, r0
+    uadd16  r3, r3, r1
+    usub16  r1, r3, r7
+    usub16  r9, r3, r10
+    sel     r1, r1, r3
+    pkhbt   r3, r1, r0, lsl #16
+    pkhtb   r9, r0, r1, asr #16
+    str     r3, [r11], #4
+    str     r9, [r11], #4
+
+    @ ---- b's pair butterfly (r12 = p_k1_b) ----
+    ldr     r0, [r12]
+    ldr     r1, [r12, #4]
+    pkhbt   r3, r0, r1, lsl #16
+    pkhtb   r1, r1, r0, asr #16
+    smulbb  r0, r1, r2
+    smultt  r9, r1, r2
+    mul     r0, r0, r4
+    mul     r9, r9, r4
+    lsr     r0, r0, #16
+    lsr     r9, r9, #16
+    mla     r0, r0, r5, r6
+    mla     r9, r9, r5, r6
+    lsr     r0, r0, #16
+    lsr     r9, r9, #16
+    pkhbt   r1, r0, r9, lsl #16
+    usub16  r0, r1, r3
+    uadd16  r9, r0, r7
+    sel     r0, r9, r0
+    ssub16  r0, r7, r0
+    uadd16  r3, r3, r1
+    usub16  r1, r3, r7
+    usub16  r9, r3, r10
+    sel     r1, r1, r3
+    pkhbt   r3, r1, r0, lsl #16
+    pkhtb   r9, r0, r1, asr #16
+    str     r3, [r12], #4
+    str     r9, [r12], #4
+
+    subs    r14, r14, #1
+    bne     nttp_vloop_scalar_merged
+
+    @ Scalar layer is the LAST layer — branch directly to done.
+    @ (Saves the layer_done bookkeeping and one cmp.)
+    b       nttp_done
+
+@ Single-butterfly fallback for m == 1 (logn==1 only).
+nttp_scalar_single:
+    @ Inline two single butterflies (a then b) sharing the same ω.
+    ldr     r8, [sp, #12]
+    ldrh    r2, [r8], #2
+    str     r8, [sp, #12]
+
+    @ ---- a's single butterfly ----
+    ldrh    r0, [r11]
+    ldrh    r1, [r11, #2]
+    mul     r1, r1, r2
+    mul     r1, r1, r4
+    lsr     r1, r1, #16
+    mla     r1, r1, r5, r6
+    lsr     r1, r1, #16
+    add     r3, r0, r1
+    cmp     r3, r5
+    it      hi
+    subhi   r3, r3, r5
+    subs    r0, r0, r1
+    it      le
+    addle   r0, r0, r5
+    strh    r3, [r11], #2
+    strh    r0, [r11], #2
+
+    @ ---- b's single butterfly (r12 = p_k1_b) ----
+    ldrh    r0, [r12]
+    ldrh    r1, [r12, #2]
+    mul     r1, r1, r2
+    mul     r1, r1, r4
+    lsr     r1, r1, #16
+    mla     r1, r1, r5, r6
+    lsr     r1, r1, #16
+    add     r3, r0, r1
+    cmp     r3, r5
+    it      hi
+    subhi   r3, r3, r5
+    subs    r0, r0, r1
+    it      le
+    addle   r0, r0, r5
+    strh    r3, [r12]
+    strh    r0, [r12, #2]
+    b       nttp_done                  @ logn==1 is the only path here; done.
+
+nttp_layer_done:
+    @ HT_bytes /= 2; m *= 2
+    lsr     r9, r9, #1
+    ldr     r0, [sp, #8]
+    lsl     r0, r0, #1
+    str     r0, [sp, #8]
+    b.w     nttp_layer
+
+nttp_done:
+    add     sp, sp, #24
+    pop     {r4-r11, lr}
+    bx      lr
+    .size   mq18433_NTT_pair_plant, .-mq18433_NTT_pair_plant
+
+
 #endif /* __ARM_FEATURE_DSP */
