@@ -38,6 +38,7 @@ LDFLAGS := $(ARCH_FLAGS) -nostdlib -nostartfiles \
 SRC_DIR := ../..
 ASM_SRC := $(SRC_DIR)/plant_18433_cm4.S
 TBL_SRC := $(SRC_DIR)/plant_18433_cm4_tables.c
+BASIS_ASM_SRC := $(SRC_DIR)/basis_m2_mul_cm4.S
 
 .PHONY: all run run-ntt run-bench run-smoke run-profile clean disasm
 all: test_montymul.elf test_ntt.elf bench_ntt.elf smoke_hawk.elf profile_hawk.elf
@@ -82,13 +83,16 @@ keccakf1600.o: $(KECCAK_SRC)
 	$(CC) $(ASFLAGS) -c $< -o $@
 
 smoke_hawk.elf: startup.o smoke_hawk.o libc_stubs.o $(SMOKE_HAWK_OBJS) \
-                keccakf1600.o plant_asm.o plant_tables.o qemu.ld
+                keccakf1600.o plant_asm.o plant_tables.o basis_m2_mul_asm.o qemu.ld
 	$(CC) $(SMOKE_LDFLAGS) startup.o smoke_hawk.o libc_stubs.o $(SMOKE_HAWK_OBJS) \
-	                       keccakf1600.o plant_asm.o plant_tables.o -lgcc -o $@
+	                       keccakf1600.o plant_asm.o plant_tables.o basis_m2_mul_asm.o -lgcc -o $@
 	@$(SIZE) $@
 
 # Compile each piece into the m4/ subdir to keep artifacts contained.
 plant_asm.o: $(ASM_SRC)
+	$(CC) $(ASFLAGS) -c $< -o $@
+
+basis_m2_mul_asm.o: $(BASIS_ASM_SRC)
 	$(CC) $(ASFLAGS) -c $< -o $@
 
 plant_tables.o: $(TBL_SRC)
@@ -176,9 +180,9 @@ PROF_HAWK_OBJS = prof_hawk_sign.o prof_hawk_vrfy.o prof_ng_hawk.o \
                  smoke_sha3.o
 
 profile_hawk.elf: startup.o profile_hawk.o libc_stubs.o $(PROF_HAWK_OBJS) \
-                  keccakf1600.o plant_asm.o plant_tables.o qemu.ld
+                  keccakf1600.o plant_asm.o plant_tables.o basis_m2_mul_asm.o qemu.ld
 	$(CC) $(SMOKE_LDFLAGS) $(PROF_WRAPS) startup.o profile_hawk.o libc_stubs.o $(PROF_HAWK_OBJS) \
-	                       keccakf1600.o plant_asm.o plant_tables.o -lgcc -o $@
+	                       keccakf1600.o plant_asm.o plant_tables.o basis_m2_mul_asm.o -lgcc -o $@
 	@$(SIZE) $@
 
 disasm: test_montymul.elf

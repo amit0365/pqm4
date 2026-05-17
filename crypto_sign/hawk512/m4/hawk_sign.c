@@ -87,7 +87,19 @@ extern uint64_t prof_encode_sig_cyc;     extern uint32_t prof_encode_sig_calls;
 /*
  * Multiplication of two binary polynomials ("carryless multiplication")
  * of degree less than 32, result has degree less than 64.
+ *
+ * On Cortex-M4 (ARMv7E-M with the DSP extension) we route this through
+ * a hand-scheduled asm leaf provided by basis_m2_mul_cm4.S; the C body
+ * below is the portable fallback (same algorithm, "holes" technique).
  */
+#if defined(__ARM_FEATURE_DSP) && __ARM_FEATURE_DSP
+extern uint64_t bp_mul_32_cm4(uint32_t x, uint32_t y);
+static inline uint64_t
+bp_mul_32(uint32_t x, uint32_t y)
+{
+	return bp_mul_32_cm4(x, y);
+}
+#else
 static uint64_t
 bp_mul_32(uint32_t x, uint32_t y)
 {
@@ -120,6 +132,7 @@ bp_mul_32(uint32_t x, uint32_t y)
 	z3 &= (uint64_t)0x8888888888888888;
 	return z0 | z1 | z2 | z3;
 }
+#endif
 
 static inline void
 bp_xor_64(uint8_t *d, const uint8_t *a, const uint8_t *b)
@@ -201,6 +214,34 @@ bp_xor_1024(uint8_t *d, const uint8_t *a, const uint8_t *b)
 #endif
 }
 
+#if defined(__ARM_FEATURE_DSP) && __ARM_FEATURE_DSP
+/*
+ * Cortex-M4 muladd leaf: hand-scheduled, with bp_mul_32_cm4 called
+ * three times and the c2 fold inlined. See basis_m2_mul_cm4.S.
+ */
+extern void bp_muladd_64_cm4(uint8_t *d, const uint8_t *a, const uint8_t *b);
+static inline void
+bp_muladd_64(uint8_t *restrict d, const uint8_t *restrict a,
+	const uint8_t *restrict b, uint8_t *restrict tmp)
+{
+	(void)tmp;
+	bp_muladd_64_cm4(d, a, b);
+}
+/*
+ * Path-1 assign-style leaf: d = a*b instead of d ^= a*b. Drops the
+ * 4 ldr + 4 eor of the muladd version. Used by bp_mul_n cascade
+ * (see MKBP_MUL macro below) to skip the bracketing memset() inside
+ * bp_mulmod_n. See basis_m2_mul_cm4.S.
+ */
+extern void bp_mul_64_cm4(uint8_t *d, const uint8_t *a, const uint8_t *b);
+static inline void
+bp_mul_64(uint8_t *restrict d, const uint8_t *restrict a,
+	const uint8_t *restrict b, uint8_t *restrict tmp)
+{
+	(void)tmp;
+	bp_mul_64_cm4(d, a, b);
+}
+#else
 static void
 bp_muladd_64(uint8_t *restrict d, const uint8_t *restrict a,
 	const uint8_t *restrict b, uint8_t *restrict tmp)
@@ -219,6 +260,26 @@ bp_muladd_64(uint8_t *restrict d, const uint8_t *restrict a,
 	enc64le(d, dec64le(d) ^ c0 ^ (c2 << 32));
 	enc64le(d + 8, dec64le(d + 8) ^ c1 ^ (c2 >> 32));
 }
+/* Portable assign-leaf (no __ARM_FEATURE_DSP): drop the read of d. */
+static void
+bp_mul_64(uint8_t *restrict d, const uint8_t *restrict a,
+	const uint8_t *restrict b, uint8_t *restrict tmp)
+{
+	(void)tmp;
+
+	uint32_t a0 = dec32le(a);
+	uint32_t a1 = dec32le(a + 4);
+	uint32_t b0 = dec32le(b);
+	uint32_t b1 = dec32le(b + 4);
+
+	uint64_t c0 = bp_mul_32(a0, b0);
+	uint64_t c1 = bp_mul_32(a1, b1);
+	uint64_t c2 = bp_mul_32(a0 ^ a1, b0 ^ b1) ^ c0 ^ c1;
+
+	enc64le(d, c0 ^ (c2 << 32));
+	enc64le(d + 8, c1 ^ (c2 >> 32));
+}
+#endif
 
 #define MKBP_MULADD(n, hn)    MKBP_MULADD_(n, hn)
 #define MKBP_MULADD_(n, hn) \
@@ -249,6 +310,52 @@ MKBP_MULADD(128, 64)
 MKBP_MULADD(256, 128)
 MKBP_MULADD(512, 256)
 
+/*
+ * Path-1 "assign" Karatsuba: bp_mul_N(d, a, b, tmp) assigns
+ *   d <- a * b
+ * (rather than the muladd contract d <- d + a*b). Same Karatsuba
+ * shape as bp_muladd_N, but the initial bp_xor_N(t1, d, d+n/8) that
+ * folds d's prior contents into t1 is skipped — and so are the
+ * memset(t1, 0, n/8) and memset(d, 0, n/8) calls that bp_mulmod_N
+ * uses to pre-zero its destinations. This eliminates ~256 bytes of
+ * memset traffic and ~108 ldr+eor pairs per bp_mulmod_512 (the
+ * leaf-level d-update reads in bp_muladd_64 become pure stores in
+ * bp_mul_64). See HANDOFF / NOTES.md "Path 1" for the rationale.
+ *
+ * Output size: d holds 2N bits (= N/4 bytes), same as bp_muladd_N.
+ * tmp usage: 4*N bits (N/2 bytes), same as bp_muladd_N.
+ *
+ * Recursion bottoms out at the bp_mul_64 leaf (asm under
+ * __ARM_FEATURE_DSP, portable C otherwise).
+ */
+#define MKBP_MUL(n, hn)    MKBP_MUL_(n, hn)
+#define MKBP_MUL_(n, hn) \
+static void \
+bp_mul_ ## n(uint8_t *restrict d, const uint8_t *restrict a, \
+	const uint8_t *restrict b, uint8_t *restrict tmp) \
+{ \
+	uint8_t *t1 = tmp; \
+	uint8_t *t2 = t1 + (n / 8); \
+	uint8_t *t3 = t2 + (n / 8); \
+	/* t2 = (a0 + a1) || (b0 + b1) (each half is hn/8 bytes) */ \
+	bp_xor_ ## hn(t2, a, a + (hn / 8)); \
+	bp_xor_ ## hn(t2 + (hn / 8), b, b + (hn / 8)); \
+	/* d[0..n/8] = a0*b0, d[n/8..2n/8] = a1*b1 */ \
+	bp_mul_ ## hn(d, a, b, t3); \
+	bp_mul_ ## hn(d + (n / 8), a + (hn / 8), b + (hn / 8), t3); \
+	/* t1 = (a0+a1)*(b0+b1) */ \
+	bp_mul_ ## hn(t1, t2, t2 + (hn / 8), t3); \
+	/* t1 ^= d_lo ^ d_hi  ==>  t1 = a0*b1 + a1*b0 */ \
+	bp_xor_ ## n(t1, t1, d); \
+	bp_xor_ ## n(t1, t1, d + (n / 8)); \
+	/* d[middle] ^= t1 */ \
+	bp_xor_ ## n(d + (hn / 8), d + (hn / 8), t1); \
+}
+
+MKBP_MUL(128, 64)
+MKBP_MUL(256, 128)
+MKBP_MUL(512, 256)
+
 #define MKBP_MULMOD(n, hn)    MKBP_MULMOD_(n, hn)
 #define MKBP_MULMOD_(n, hn) \
 static void \
@@ -257,16 +364,16 @@ bp_mulmod_ ## n(uint8_t *restrict d, const uint8_t *restrict a, \
 { \
 	uint8_t *t1 = tmp; \
 	uint8_t *t2 = t1 + (n / 8); \
-	/* t1 <- (a0 + a1)*(b0 + b1) */ \
+	/* d = (a0 + a1) || (b0 + b1)  -- scratch for the next mul */ \
 	bp_xor_ ## hn(d, a, a + (hn / 8)); \
 	bp_xor_ ## hn(d + (hn / 8), b, b + (hn / 8)); \
-	memset(t1, 0, (n / 8)); \
-	bp_muladd_ ## hn(t1, d, d + (hn / 8), t2); \
-	/* d <- a0*b0 + a1*b1 */ \
-	memset(d, 0, (n / 8)); \
-	bp_muladd_ ## hn(d, a, b, t2); \
+	/* t1 = (a0+a1)*(b0+b1)        -- ASSIGN (no memset(t1, 0)) */ \
+	bp_mul_ ## hn(t1, d, d + (hn / 8), t2); \
+	/* d = a0*b0                   -- ASSIGN (no memset(d, 0)) */ \
+	bp_mul_ ## hn(d, a, b, t2); \
+	/* d ^= a1*b1 (XOR-add the second half) */ \
 	bp_muladd_ ## hn(d, a + (hn / 8), b + (hn / 8), t2); \
-	/* t1 <- t1 + d = a0*b1 + a1*b0 */ \
+	/* t1 ^= d                     -- t1 = a0*b1 + a1*b0 */ \
 	bp_xor_ ## n(t1, t1, d); \
 	/* d <- d + rotate_{n/2}(t1) */ \
 	bp_xor_ ## hn(d, d, t1 + (hn / 8)); \
