@@ -33,6 +33,191 @@ mq18433_NTT_pair(unsigned logn, uint16_t *a, uint16_t *b) {
 }
 #endif
 
+/* ------------------------------------------------------------------ *
+ * Packed-pair pointwise Montgomery helpers (Cortex-M4 / ARMv7E-M DSP).
+ *
+ * Two helpers replace the pointwise loops in hawk_sign.c that follow
+ * the NTT_pair calls. Each helper processes TWO uint16 coefficients per
+ * iteration via smulbb/smultt halfword multiplies, reusing the same
+ * Plantard reduction kernel proven byte-identical to Zq(montymul) in
+ * plant_18433_cm4.S.
+ *
+ *   mq18433_pointwise_mul_inplace(w1, w2, n):
+ *       w1[u] = mq18433_montymul(w1[u], w2[u])   for u = 0..n-1
+ *
+ *   mq18433_pointwise_fused_loop2(w3, w2, w1, n):
+ *       w3[u] = mq18433_tomonty(
+ *                   mq18433_sub(
+ *                       mq18433_montymul(w2[u], w3[u]),
+ *                       w1[u]))
+ *
+ * Pre-conditions:
+ *   - n is a multiple of 2 (always true for HAWK: n = 2^logn, logn >= 1).
+ *   - All pointers are 4-byte aligned (tt32-derived in hawk_sign.c).
+ *   - Inputs are uint16 in [1..Q] (canonical HAWK form).
+ *
+ * Constants used:
+ *   Q   = 18433
+ *   Q0I = 0xEBC047FF      (Plantard reciprocal, -1/Q mod 2^32)
+ *   QA  = 0x10000         (canonical-add bias for Plantard)
+ *   R2  = 806             (2^64 mod Q, for tomonty)
+ *
+ * The Plantard kernel per lane (lane = lo or hi half) is:
+ *   c = a_h * b_h         (smulbb / smultt — both halves < 2^15 ⇒ signed = unsigned)
+ *   t = c * Q0I  mod 2^32
+ *   h = t >> 16
+ *   r = (h*Q + QA) >> 16  in [1..Q]
+ *
+ * Canonical sub matches the C reference Zq(sub):
+ *   sub(x, y) = canonical(x - y) in [1..Q] (with 0 represented as Q).
+ *
+ * For the packed canonical sub of (mm - w1) per half:
+ *   d   = usub16(w1, mm)         per-half w1 - mm with uint16 wrap
+ *   d2  = uadd16(d, Q_packed)    sets GE flags iff a borrow happened (w1 < mm),
+ *                                meaning the unsigned subtract underflowed.
+ *   d3  = sel(d2, d)             per half: wrap-corrected if borrow, else d
+ *   res = ssub16(Q_packed, d3)   per-half Q - d3 ⇒ canonical(mm - w1) in [1..Q]
+ *
+ * This is the same canonical sub used in plant_18433_cm4.S NTT/iNTT path.
+ * ------------------------------------------------------------------ */
+#if defined(__ARM_FEATURE_DSP) && __ARM_FEATURE_DSP
+
+static inline void
+mq18433_pointwise_mul_inplace(uint16_t *w1, const uint16_t *w2, size_t n)
+{
+	/* Process n/2 packed pairs. Constants pinned in registers; loop
+	 * runs entirely inside the asm block to avoid reloading.
+	 *
+	 * Key micro-optimization: after the two `mla` instructions the
+	 * Plantard reduction result lives in bits[31:16] of `lo` and `hi`.
+	 * Use `pkhtb Rd, hi, lo, ASR #16` to atomically extract:
+	 *   Rd[31:16] = hi[31:16]   (= reduced_hi)
+	 *   Rd[15:0]  = (lo >> 16)[15:0]  (= reduced_lo)
+	 * This collapses `lsr; lsr; pkhbt` (3 ops) into one `pkhtb` (1 op),
+	 * saving 2 instructions per packed iter. */
+	uint32_t w1v_s, w2v_s, lo_s, hi_s;
+	uint32_t Q0I_s, Q_s, QA_s;
+	size_t  n2 = n >> 1;
+	__asm__ volatile (
+		"movw	%[Q0I], #0x47FF\n\t"
+		"movt	%[Q0I], #0xEBC0\n\t"      /* Q0I = 0xEBC047FF */
+		"movw	%[Q],   #18433\n\t"
+		"mov.w	%[QA],  #0x10000\n\t"
+		"1:\n\t"
+		"ldr	%[w1v], [%[p_w1]]\n\t"
+		"ldr	%[w2v], [%[p_w2]], #4\n\t"
+		"smulbb	%[lo], %[w1v], %[w2v]\n\t"
+		"smultt	%[hi], %[w1v], %[w2v]\n\t"
+		"mul	%[lo], %[lo], %[Q0I]\n\t"
+		"mul	%[hi], %[hi], %[Q0I]\n\t"
+		"lsr	%[lo], %[lo], #16\n\t"
+		"lsr	%[hi], %[hi], #16\n\t"
+		"mla	%[lo], %[lo], %[Q], %[QA]\n\t"
+		"mla	%[hi], %[hi], %[Q], %[QA]\n\t"
+		"pkhtb	%[w1v], %[hi], %[lo], asr #16\n\t"
+		"str	%[w1v], [%[p_w1]], #4\n\t"
+		"subs	%[n2], %[n2], #1\n\t"
+		"bne	1b\n\t"
+		: [p_w1] "+r" (w1), [p_w2] "+r" (w2), [n2] "+r" (n2),
+		  [w1v] "=&r" (w1v_s), [w2v] "=&r" (w2v_s),
+		  [lo]  "=&r" (lo_s),  [hi]  "=&r" (hi_s),
+		  [Q0I] "=&r" (Q0I_s), [Q]   "=&r" (Q_s),
+		  [QA]  "=&r" (QA_s)
+		:
+		: "cc", "memory"
+	);
+	(void)w1v_s; (void)w2v_s; (void)lo_s; (void)hi_s;
+	(void)Q0I_s; (void)Q_s;  (void)QA_s;
+}
+
+static inline void
+mq18433_pointwise_fused_loop2(uint16_t *w3, const uint16_t *w2,
+                              const uint16_t *w1, size_t n)
+{
+	/* Register budget: 4 "+r" (3 ptrs + counter) + 10 "=&r" outputs
+	 *   = 14 hard registers. r0–r12 + lr exactly cover this on ARMv7-M.
+	 *
+	 * We pin Q0I, Q (scalar), QA, and Q_packed across iterations (4 const
+	 * regs) but NOT R2 — it's loaded once per iter into w1v (dead after
+	 * canon-sub) via a single `movw, #806` (1 cycle). Then smulbb (mm_lo
+	 * × R2_lo) and smultb (mm_hi × R2_lo) extract both lanes without an
+	 * explicit `lsr` because smultb already picks the top half of mm. */
+	uint32_t w1v_s, w2v_s, w3v_s, mm_s, lo_s, hi_s;
+	uint32_t Q0I_s, Q_s, QA_s, Qpkd_s;
+	size_t   n2 = n >> 1;
+	__asm__ volatile (
+		"movw	%[Q0I], #0x47FF\n\t"
+		"movt	%[Q0I], #0xEBC0\n\t"
+		"movw	%[Q],   #18433\n\t"
+		"mov.w	%[QA],  #0x10000\n\t"
+		"pkhbt	%[Qpkd], %[Q], %[Q], lsl #16\n\t"        /* Q_packed = (Q<<16)|Q */
+		"1:\n\t"
+		/* Load w2, w3, w1 (each packed pair). */
+		"ldr	%[w2v], [%[p_w2]], #4\n\t"
+		"ldr	%[w3v], [%[p_w3]]\n\t"
+		"ldr	%[w1v], [%[p_w1]], #4\n\t"
+
+		/* Plantard kernel #1: mm_lane = montymul(w2_lane, w3_lane).
+		 * After both `mla`s the reduced values live in bits[31:16]; the
+		 * `pkhtb Rd, hi, lo, ASR #16` fuses lsr_lo+lsr_hi+pkhbt into one
+		 * op (saves 2 instructions). */
+		"smulbb	%[lo], %[w2v], %[w3v]\n\t"
+		"smultt	%[hi], %[w2v], %[w3v]\n\t"
+		"mul	%[lo], %[lo], %[Q0I]\n\t"
+		"mul	%[hi], %[hi], %[Q0I]\n\t"
+		"lsr	%[lo], %[lo], #16\n\t"
+		"lsr	%[hi], %[hi], #16\n\t"
+		"mla	%[lo], %[lo], %[Q], %[QA]\n\t"
+		"mla	%[hi], %[hi], %[Q], %[QA]\n\t"
+		"pkhtb	%[mm], %[hi], %[lo], asr #16\n\t"
+
+		/* Canonical sub: mm := canonical(mm - w1) per lane.
+		 * Pattern mirrors plant_18433_cm4.S NTT canon-sub:
+		 *   d   = usub16(w1, mm)         per-half w1 - mm (wraps)
+		 *   d2  = uadd16(d, Q_packed)    GE set iff borrow (w1 < mm)
+		 *   d3  = sel(d2, d)             wrap-corrected if borrow
+		 *   res = ssub16(Q_packed, d3)   Q - d3 = canon(mm - w1) ∈ [1..Q]
+		 * Result: Zq_sub(mm, w1) = canonical(mm - w1). */
+		"usub16	%[lo], %[w1v], %[mm]\n\t"
+		"uadd16	%[hi], %[lo], %[Qpkd]\n\t"
+		"sel	%[lo], %[hi], %[lo]\n\t"
+		"ssub16	%[mm], %[Qpkd], %[lo]\n\t"
+
+		/* Plantard kernel #2: tomonty(sub_result) = montymul(sub_result, R2).
+		 * R2 = 806 (16-bit) is materialized in w1v's low 16 (w1v is dead
+		 * after canon-sub). The half-multiplies use smulbb (mm_lo × R2_lo)
+		 * and smultb (mm_hi × R2_lo) — smultb extracts mm's top half on
+		 * the fly, saving the `lsr hi, mm, #16` we used in the earlier
+		 * draft. Same pkhtb fusion as kernel #1. */
+		"movw	%[w1v], #806\n\t"               /* w1v = R2 (in low 16) */
+		"smulbb	%[lo], %[mm], %[w1v]\n\t"       /* lo = mm_lo * R2 */
+		"smultb	%[hi], %[mm], %[w1v]\n\t"       /* hi = mm_hi * R2 */
+		"mul	%[lo], %[lo], %[Q0I]\n\t"
+		"mul	%[hi], %[hi], %[Q0I]\n\t"
+		"lsr	%[lo], %[lo], #16\n\t"
+		"lsr	%[hi], %[hi], #16\n\t"
+		"mla	%[lo], %[lo], %[Q], %[QA]\n\t"
+		"mla	%[hi], %[hi], %[Q], %[QA]\n\t"
+		"pkhtb	%[mm], %[hi], %[lo], asr #16\n\t"
+		"str	%[mm], [%[p_w3]], #4\n\t"
+
+		"subs	%[n2], %[n2], #1\n\t"
+		"bne	1b\n\t"
+		: [p_w3] "+r" (w3), [p_w2] "+r" (w2), [p_w1] "+r" (w1),
+		  [n2] "+r" (n2),
+		  [w1v] "=&r" (w1v_s), [w2v] "=&r" (w2v_s), [w3v] "=&r" (w3v_s),
+		  [mm]  "=&r" (mm_s),  [lo]  "=&r" (lo_s),  [hi]  "=&r" (hi_s),
+		  [Q0I] "=&r" (Q0I_s), [Q]   "=&r" (Q_s),   [QA]  "=&r" (QA_s),
+		  [Qpkd] "=&r" (Qpkd_s)
+		:
+		: "cc", "memory"
+	);
+	(void)w1v_s; (void)w2v_s; (void)w3v_s; (void)mm_s; (void)lo_s; (void)hi_s;
+	(void)Q0I_s; (void)Q_s;   (void)QA_s;  (void)Qpkd_s;
+}
+
+#endif /* __ARM_FEATURE_DSP */
+
 /* Profiling hooks (off by default). When HAWK_PROFILE is defined to
  * non-zero, the call sites in sign_finish_inner are bracketed with
  * cycle-counter snapshots that accumulate into externally-defined
@@ -1364,9 +1549,14 @@ sign_finish_inner(unsigned logn, int use_shake,
 		}
 		mq18433_poly_set_small_inplace_high(logn, w2);
 		mq18433_NTT_pair(logn, w1, w2);
+#if defined(__ARM_FEATURE_DSP) && __ARM_FEATURE_DSP
+		/* Packed-pair montymul: w1[u] = mq18433_montymul(w1[u], w2[u]). */
+		mq18433_pointwise_mul_inplace(w1, w2, n);
+#else
 		for (size_t u = 0; u < n; u ++) {
 			w1[u] = mq18433_montymul(w1[u], w2[u]);
 		}
+#endif
 
 		/* w3 <- 2*(f*x1 - g*x0) = h1 - 2*s1 */
 		mq18433_poly_set_small(logn, w2, x1);
@@ -1376,10 +1566,15 @@ sign_finish_inner(unsigned logn, int use_shake,
 			mq18433_poly_set_small_inplace_high(logn, w3);
 		}
 		mq18433_NTT_pair(logn, w2, w3);
+#if defined(__ARM_FEATURE_DSP) && __ARM_FEATURE_DSP
+		/* Packed-pair fused: w3[u] = tomonty(sub(montymul(w2,w3), w1)). */
+		mq18433_pointwise_fused_loop2(w3, w2, w1, n);
+#else
 		for (size_t u = 0; u < n; u ++) {
 			w3[u] = mq18433_tomonty(mq18433_sub(
 				mq18433_montymul(w2[u], w3[u]), w1[u]));
 		}
+#endif
 		mq18433_iNTT(logn, w3);
 		mq18433_poly_snorm(logn, w3);
 
