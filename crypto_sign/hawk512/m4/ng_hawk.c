@@ -121,6 +121,100 @@ regen_fg_8(int8_t *restrict f, int8_t *restrict g, const void *seed)
 	}
 }
 
+#if defined(HAWK_MP_ASM_CORTEXM4) && HAWK_MP_ASM_CORTEXM4 \
+    && defined(__ARM_ARCH_7EM__) && defined(__ARM_FEATURE_DSP) \
+    && __ARM_FEATURE_DSP
+/*
+ * Cortex-M4 fast path. Per HAWK-512 seed expansion, each 8 SHAKE
+ * bytes become 8 int8_t values: popcount-per-byte then subtract 4.
+ *
+ * Wins vs the portable C path:
+ *
+ *  1) Batch the SHAKE squeezing: extract 256 bytes per outer j in
+ *     a single shake_extract() call, instead of 32 8-byte calls.
+ *     That removes 31 shake_extract function-call frames per j
+ *     plus their per-call dptr bookkeeping; the underlying Keccak
+ *     primitive work is unchanged (just two permutes per j either
+ *     way, since rate=136 and we squeeze 256 bytes).
+ *
+ *  2) Pull each 8-byte chunk as two uint32_t halves and run the
+ *     SWAR popcount on the halves independently — avoids the
+ *     cross-word 64-bit shifts that the portable C path forces.
+ *
+ *  3) Per-byte subtract 4 by USUB8 (single DSP-ext instruction
+ *     for all four bytes); wrap-around gives the correct
+ *     two's-complement int8_t for popcount values in [0..8].
+ *
+ *  4) Write each 4-byte result with a single STR (via memcpy of a
+ *     uint32_t to a possibly-unaligned int8_t*; Cortex-M4 handles
+ *     unaligned word stores transparently).
+ *
+ * The hot loop runs 4*32 = 128 iterations per call.
+ */
+static void
+regen_fg_9(int8_t *restrict f, int8_t *restrict g, const void *seed)
+{
+	size_t seed_len = 24;
+	for (size_t j = 0; j < 4; j ++) {
+		shake_context sc;
+		shake_init(&sc, 256);
+		shake_inject(&sc, seed, seed_len);
+		uint8_t jx = (uint8_t)j;
+		shake_inject(&sc, &jx, 1);
+		shake_flip(&sc);
+
+		/* Squeeze the whole 256-byte chunk for this j in one call.
+		 * uint32_t[64] guarantees 4-byte alignment, matching the
+		 * subsequent two-LDR/iteration load pattern below. */
+		uint32_t qbuf[64];
+		shake_extract(&sc, qbuf, sizeof qbuf);
+
+		/* First 16 chunks (u=0..480 step 32, 16 iters) write to f.
+		 * Last 16 chunks (u=512..992 step 32, 16 iters) write to g.
+		 * Splitting the loop in two drops the `u < 512` branch
+		 * from the hot path.
+		 *
+		 * Per-byte popcount uses the standard 3-stage SWAR with
+		 * the two well-known size reductions:
+		 *   stage 1: q -= (q>>1) & 0x55..        (1 AND + 1 SUB)
+		 *   stage 2: q = (q & 0x33..) + ((q>>2) & 0x33..)
+		 *   stage 3: q = (q + (q>>4)) & 0x0F..   (1 ADD + 1 AND;
+		 *            safe because per-byte sum after stage 2 is
+		 *            in [0..8] and adding two 0..4 nibbles within
+		 *            a byte never overflows the byte). */
+		const uint32_t *qp = qbuf;
+		const uint32_t four = 0x04040404u;
+		int8_t *dst = f + (j << 3);
+		for (int half = 0; half < 2; half++) {
+			for (size_t u = 0; u < 512; u += 32) {
+				uint32_t q_lo = qp[0];
+				uint32_t q_hi = qp[1];
+				qp += 2;
+
+				q_lo -= (q_lo >> 1) & 0x55555555u;
+				q_hi -= (q_hi >> 1) & 0x55555555u;
+				q_lo = (q_lo & 0x33333333u)
+					+ ((q_lo >> 2) & 0x33333333u);
+				q_hi = (q_hi & 0x33333333u)
+					+ ((q_hi >> 2) & 0x33333333u);
+				q_lo = (q_lo + (q_lo >> 4)) & 0x0F0F0F0Fu;
+				q_hi = (q_hi + (q_hi >> 4)) & 0x0F0F0F0Fu;
+
+				uint32_t r_lo, r_hi;
+				__asm__ ("usub8 %0, %1, %2"
+					: "=r" (r_lo) : "r" (q_lo), "r" (four));
+				__asm__ ("usub8 %0, %1, %2"
+					: "=r" (r_hi) : "r" (q_hi), "r" (four));
+
+				int8_t *p = dst + u;
+				memcpy(p, &r_lo, 4);
+				memcpy(p + 4, &r_hi, 4);
+			}
+			dst = g + (j << 3);
+		}
+	}
+}
+#else
 static void
 regen_fg_9(int8_t *restrict f, int8_t *restrict g, const void *seed)
 {
@@ -155,6 +249,7 @@ regen_fg_9(int8_t *restrict f, int8_t *restrict g, const void *seed)
 		}
 	}
 }
+#endif
 
 static void
 regen_fg_10(int8_t *restrict f, int8_t *restrict g, const void *seed)

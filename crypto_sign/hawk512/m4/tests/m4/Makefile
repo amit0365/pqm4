@@ -173,7 +173,7 @@ prof_hawk_sign.o: $(SRC_DIR)/hawk_sign.c
 prof_hawk_vrfy.o: $(SRC_DIR)/hawk_vrfy.c
 	$(CC) $(SMOKE_CFLAGS) -DHAWK_PROFILE=1 -DHAWK_MP_ASM_CORTEXM4=1 -c $< -o $@
 prof_ng_hawk.o: $(SRC_DIR)/ng_hawk.c
-	$(CC) $(SMOKE_CFLAGS) -DHAWK_PROFILE=1 -c $< -o $@
+	$(CC) $(SMOKE_CFLAGS) -DHAWK_PROFILE=1 -DHAWK_MP_ASM_CORTEXM4=1 -c $< -o $@
 
 PROF_HAWK_OBJS = prof_hawk_sign.o prof_hawk_vrfy.o prof_ng_hawk.o \
                  smoke_hawk_kgen.o \
@@ -229,6 +229,12 @@ disasm: test_montymul.elf
 disasm-sign: smoke_hawk_sign.o
 	$(OBJDUMP) -d $< -j .text > smoke_hawk_sign.dis
 	@echo "wrote smoke_hawk_sign.dis"
+
+# Disassembly target for ng_hawk.c, where Hawk_regen_fg lives. Useful
+# when iterating on the regen_fg_9 inner-loop SWAR popcount.
+disasm-ng-hawk: prof_ng_hawk.o
+	$(OBJDUMP) -d $< -j .text > prof_ng_hawk.dis
+	@echo "wrote prof_ng_hawk.dis"
 
 clean:
 	rm -f *.o *.elf
